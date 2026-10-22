@@ -1,0 +1,137 @@
+:root {
+  --bg: #f6f6f4;
+  --panel: #ffffff;
+  --text: #1d1d1f;
+  --muted: #6e6e73;
+  --line: rgba(0, 0, 0, 0.1);
+  --accent: #2f6fdb;
+  --accent-text: #ffffff;
+  --warn: #b25c00;
+  --error: #c62828;
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161618;
+    --panel: #1c1c1e;
+    --text: #e6e6e6;
+    --muted: #9a9aa0;
+    --line: rgba(255, 255, 255, 0.1);
+    --accent: #5b9cf5;
+    --accent-text: #0b1220;
+    --warn: #e5a54b;
+    --error: #ef6b6b;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body { background: var(--bg); }
+
+.app { display: flex; flex-direction: column; height: 100%; }
+.loading, .empty { display: grid; place-items: center; height: 100%; color: var(--muted); }
+
+button, select, input {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 9px;
+}
+button { cursor: pointer; }
+button:disabled { opacity: 0.45; cursor: default; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: transparent; }
+input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  padding: 8px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.topbar .group { display: flex; align-items: center; gap: 8px; }
+.topbar .right { margin-left: auto; }
+.project { font-weight: 600; min-width: 160px; }
+.field { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.field input, .field select { color: var(--text); }
+.currencies { width: 110px; text-transform: uppercase; }
+.rates { color: var(--muted); font-size: 12px; }
+.rates span { white-space: nowrap; }
+.rates span.missing { color: var(--warn); }
+
+.rate-form {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+.rate-form input { width: auto; }
+
+.grid-area { flex: 1; min-height: 0; position: relative; }
+
+.totals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 28px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+}
+.totals .big { display: flex; gap: 26px; }
+.total { display: flex; flex-direction: column; }
+.total .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.total .amount { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.total.incomplete .amount { color: var(--warn); }
+.total .flag { color: var(--warn); font-size: 11px; }
+.totals .detail { flex: 1; min-width: 280px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.totals .warning { color: var(--warn); }
+
+.tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 0 8px;
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+  height: 32px;
+  overflow-x: auto;
+}
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+  border-bottom: 2px solid transparent;
+}
+.tab.active { color: var(--text); background: var(--panel); border-bottom-color: var(--accent); font-weight: 600; }
+.tab input { width: 140px; padding: 2px 6px; }
+.tab .close { border: none; background: none; padding: 0 2px; color: var(--muted); font-size: 15px; line-height: 1; }
+.tabs .add { border: none; background: none; font-size: 17px; color: var(--muted); padding: 0 10px; }
+.tabs .hint { margin-left: auto; align-self: center; color: var(--muted); font-size: 11px; white-space: nowrap; padding-left: 16px; }
+
+.toast {
+  position: fixed;
+  right: 16px;
+  bottom: 44px;
+  max-width: 460px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--text);
+  color: var(--bg);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+}
+.toast.error { background: var(--error); color: #fff; }

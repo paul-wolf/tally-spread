@@ -1,0 +1,29 @@
+[package]
+name = "tally-core"
+description = "Engine for Tally: exact multi-currency money, exchange rates, operation log and cost lists on DuckDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+csv = "1.4.0"
+dirs = "7.0.0"
+duckdb = { version = "1.20000.0", features = ["bundled"] }
+rust_decimal = { version = "1.43.0", features = ["serde-with-str", "maths"] }
+rust_decimal_macros = "1.40.0"
+rust_xlsxwriter = "0.101.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+ulid = { version = "3.0.0", features = ["serde"] }
+ureq = { version = "3.5.0", optional = true }
+
+[features]
+default = []
+# Network fetchers for official exchange-rate sources (ECB, NBU, HMRC).
+fetch = ["dep:ureq"]
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/tally-core", "crates/tally-cli", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/paul-wolf/tally-spread"
+
+# Dependencies (above all DuckDB, compiled from C++) build without debug info:
+# much smaller target/ and faster builds. Our own crates keep full debug info.
+[profile.dev.package."*"]
+debug = false

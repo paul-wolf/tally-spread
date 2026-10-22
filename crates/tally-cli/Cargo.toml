@@ -1,0 +1,16 @@
+[package]
+name = "tally-cli"
+description = "Command line for Tally: update exchange rates (e.g. daily on the hub), convert amounts, query projects with SQL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tally"
+path = "src/main.rs"
+
+[dependencies]
+tally-core = { path = "../tally-core", features = ["fetch"] }
+chrono = "0.4.45"
+duckdb = { version = "1.20000.0", features = ["bundled"] }

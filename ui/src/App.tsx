@@ -140,22 +140,35 @@ export default function App() {
     [apply, fail],
   );
 
-  /** Paste tab-separated text at the selected cell, adding rows as needed: one undo step. */
+  /**
+   * Paste tab-separated text (as Excel and Google Sheets copy it) at the selected
+   * cell, or below the last row if nothing is selected. Adds rows as needed; the
+   * whole paste is one undo step.
+   */
   const paste = useCallback(
     async (transposed: boolean) => {
       const v = snapRef.current?.sheet;
+      if (!v) return;
       const sel = selectionRef.current;
-      const cell = sel.current?.cell ?? (sel.rows.length ? ([0, sel.rows.first()!] as const) : null);
-      if (!v || !cell) return;
+      const cell: [number, number] = sel.current
+        ? [sel.current.cell[0], sel.current.cell[1]]
+        : sel.rows.length
+          ? [0, sel.rows.first()!]
+          : [0, v.rows.length];
       try {
         const text = await readText();
         if (!text) return;
         let grid = parseTsv(text);
         if (transposed) grid = transpose(grid).map((r) => r.map((c) => c ?? ""));
-        const ops = opsForBlock(v, [cell[0], cell[1]], grid);
+        const { ops, skippedCells, skippedHeader } = opsForBlock(v, cell, grid);
         if (ops.length) await apply({ op: "batch", ops });
+        const notes = [
+          skippedHeader ? "skipped the heading row" : "",
+          skippedCells ? `left out ${skippedCells} value${skippedCells > 1 ? "s" : ""} that didn't fit the column` : "",
+        ].filter(Boolean);
+        if (notes.length) setMessage({ text: `Pasted; ${notes.join(", ")}.` });
       } catch (e) {
-        fail(`Could not read the clipboard: ${e}`);
+        fail(`Could not paste: ${e}`);
       }
     },
     [apply, fail],

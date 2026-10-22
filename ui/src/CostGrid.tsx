@@ -17,6 +17,9 @@ import type { Column, CostListView, Op, Snapshot } from "./types";
 
 type ColDef = GridColumn & { id: string; edit?: Column; numeric?: boolean };
 
+/** Empty rows always shown below the data, ready to type or paste into. */
+export const BLANK_ROWS = 40;
+
 const BASE_COLUMNS: ColDef[] = [
   { id: "item", title: "Item", width: 280, edit: "item" },
   { id: "url", title: "Link", width: 220, edit: "url" },
@@ -101,32 +104,88 @@ export function opsForClear(view: CostListView, sel: GridSelection): Op[] {
   return ops;
 }
 
-/** Operations that write a block of values starting at a cell, adding rows as needed. */
-export function opsForBlock(view: CostListView, target: Item, values: readonly (readonly string[])[]): Op[] {
+/** Roughly what the engine accepts as an amount: "1 234,56", "£12.50", "19,90 EUR", "(15)". */
+export function looksLikeAmount(v: string): boolean {
+  const t = v
+    .replace(/[\s\u00a0\u202f'’]/g, "")
+    .replace(/^\(|\)$/g, "")
+    .replace(/^-|-$/g, "")
+    .replace(/^(грн\.?|[₴£€$¥]|[A-Za-z]{3})/i, "")
+    .replace(/(грн\.?|[₴£€$¥]|zł|[A-Za-z]{3})$/i, "")
+    .replace(/^-/, "");
+  return /^(\d[\d.,]*|[.,]\d+)$/.test(t);
+}
+
+const looksLikeCurrency = (v: string) => /^\s*[A-Za-z]{3}\s*$/.test(v);
+
+/** Is this value acceptable for the column? Empty is always fine (it clears). */
+function acceptable(column: Column, v: string): boolean {
+  if (v.trim() === "") return true;
+  if (column === "qty" || column === "unit_price") return looksLikeAmount(v);
+  if (column === "currency") return looksLikeCurrency(v);
+  return true;
+}
+
+/**
+ * Operations that write a block of values starting at a cell, adding rows as
+ * needed. A first line that looks like column headings is skipped, and values a
+ * column cannot take (text in Qty, say) are left out, so one stray cell does not
+ * stop the whole paste.
+ */
+export function opsForBlock(
+  view: CostListView,
+  target: Item,
+  values: readonly (readonly string[])[],
+): { ops: Op[]; skippedCells: number; skippedHeader: boolean } {
   const cols = columnsFor(view);
   const ops: Op[] = [];
   let nextPos = Math.max(0, ...view.rows.map((r) => r.position)) + 1;
   const [col0, row0] = target;
-  values.forEach((line, i) => {
-    let rowId = view.rows[row0 + i]?.row_id;
+  let skippedCells = 0;
+
+  const colFor = (j: number) => cols[col0 + j];
+  const first = values[0] ?? [];
+  const skippedHeader =
+    values.length > 1 &&
+    first.some((v, j) => {
+      const c = colFor(j)?.edit;
+      return !!c && v.trim() !== "" && !acceptable(c, v);
+    });
+  const lines = skippedHeader ? values.slice(1) : values;
+
+  let y = row0;
+  for (const line of lines) {
+    if (line.every((v) => v.trim() === "")) {
+      y++;
+      continue;
+    }
+    let rowId = view.rows[y]?.row_id;
     if (!rowId) {
-      if (line.every((v) => v.trim() === "")) return;
       rowId = newId();
       ops.push({ op: "insert_row", sheet_id: view.sheet_id, row_id: rowId, position: nextPos++ });
     }
+    const isNew = !view.rows[y];
     line.forEach((value, j) => {
-      const def = cols[col0 + j];
-      if (!def?.edit) return;
+      const column = colFor(j)?.edit;
+      if (!column) return;
+      // Empty cells clear existing values, but are simply skipped on new rows (so an
+      // empty currency cell does not undo the currency in "$25").
+      if (isNew && value.trim() === "") return;
+      if (!acceptable(column, value)) {
+        skippedCells++;
+        return;
+      }
       ops.push({
         op: "set_cell",
         sheet_id: view.sheet_id,
         row_id: rowId!,
-        column: def.edit,
+        column,
         value: value.trim() === "" ? null : value,
       });
     });
-  });
-  return ops;
+    y++;
+  }
+  return { ops, skippedCells, skippedHeader };
 }
 
 const darkTheme: Partial<Theme> = {
@@ -165,12 +224,20 @@ export function CostGrid({ view, apply, selection, setSelection, dark }: Props) 
   // The latest rows, readable from callbacks that run after an await.
   const viewRef = useRef(view);
   viewRef.current = view;
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
 
   const getCellContent = useCallback(
     ([col, row]: Item): GridCell => {
       const r = view.rows[row];
       const def = columns[col];
-      if (!r || !def) return { kind: GridCellKind.Text, data: "", displayData: "", allowOverlay: false };
+      if (!def) return { kind: GridCellKind.Text, data: "", displayData: "", allowOverlay: false };
+      if (!r) {
+        // A blank row below the data: editable, becomes a real row when typed into.
+        return def.edit
+          ? { kind: GridCellKind.Text, data: "", displayData: "", allowOverlay: true }
+          : { kind: GridCellKind.Text, data: "", displayData: "", allowOverlay: false, readonly: true };
+      }
 
       if (def.id === "url") {
         // A text cell (so typing into it keeps the first key), drawn as a link.
@@ -215,35 +282,55 @@ export function CostGrid({ view, apply, selection, setSelection, dark }: Props) 
     (edits: readonly { location: Item; value: EditableGridCell }[]) => {
       const v = viewRef.current;
       const ops: Op[] = [];
-      for (const { location, value } of edits) {
+      // Blank rows typed into become new rows, in the order they appear.
+      const newRows = new Map<number, string>();
+      let nextPos = Math.max(0, ...v.rows.map((r) => r.position)) + 1;
+      const sorted = [...edits].sort((a, b) => a.location[1] - b.location[1]);
+      for (const { location, value } of sorted) {
         const def = columns[location[0]];
-        const row = v.rows[location[1]];
-        if (!def?.edit || !row) continue;
+        if (!def?.edit) continue;
         const data = "data" in value && typeof value.data === "string" ? value.data : "";
-        const old = row[def.edit] ?? "";
-        if (data === old) continue;
+        const row = v.rows[location[1]];
+        let rowId: string | undefined = row?.row_id;
+        if (!row) {
+          if (data.trim() === "") continue;
+          rowId = newRows.get(location[1]);
+          if (!rowId) {
+            rowId = newId();
+            newRows.set(location[1], rowId);
+            ops.push({ op: "insert_row", sheet_id: v.sheet_id, row_id: rowId, position: nextPos++ });
+          }
+        } else if (data === (row[def.edit] ?? "")) {
+          continue;
+        }
         ops.push({
           op: "set_cell",
           sheet_id: v.sheet_id,
-          row_id: row.row_id,
+          row_id: rowId!,
           column: def.edit,
           value: data.trim() === "" ? null : data,
         });
       }
-      if (ops.length) void apply(ops.length === 1 ? ops[0] : { op: "batch", ops });
+      if (!ops.length) return true;
+      void apply(ops.length === 1 ? ops[0] : { op: "batch", ops }).then((snap) => {
+        // New rows are added straight after the data. If a row was started further
+        // down, move the cursor up to it so Tab carries on along the same row.
+        const firstNew = Math.min(...newRows.keys());
+        if (!snap?.sheet || !Number.isFinite(firstNew)) return;
+        const landed = v.rows.length;
+        const cur = selectionRef.current.current;
+        if (cur && cur.cell[1] === firstNew && firstNew !== landed) {
+          const x = cur.cell[0];
+          setSelection({
+            ...emptySelection,
+            current: { cell: [x, landed], range: { x, y: landed, width: 1, height: 1 }, rangeStack: [] },
+          });
+        }
+      });
       return true;
     },
-    [apply, columns],
+    [apply, columns, setSelection],
   );
-
-  const onRowAppended = useCallback(async () => {
-    const v = viewRef.current;
-    const position = Math.max(0, ...v.rows.map((r) => r.position)) + 1;
-    const snap = await apply({ op: "insert_row", sheet_id: v.sheet_id, row_id: newId(), position });
-    // The grid edits the new row right away, before React re-renders with it.
-    if (snap?.sheet) viewRef.current = snap.sheet;
-    return "bottom" as const;
-  }, [apply]);
 
   const onDelete = useCallback(
     (sel: GridSelection) => {
@@ -288,14 +375,12 @@ export function CostGrid({ view, apply, selection, setSelection, dark }: Props) 
     <DataEditor
       onCellClicked={onCellClicked}
       columns={columns}
-      rows={view.rows.length}
+      rows={view.rows.length + BLANK_ROWS}
       getCellContent={getCellContent}
       getCellsForSelection={true}
       onCellsEdited={onCellsEdited}
       onPaste={false}
       onDelete={onDelete}
-      onRowAppended={onRowAppended}
-      trailingRowOptions={{ hint: "New item", sticky: true, tint: true, targetColumn: 0 }}
       rowMarkers="both"
       smoothScrollX
       smoothScrollY

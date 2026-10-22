@@ -1,0 +1,22 @@
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Rust / Tauri
+target/
+src-tauri/target/
+
+# Node
+node_modules/
+dist/
+
+# Python
+__pycache__/
+.venv/
+
+# Local data and caches (DuckDB is a rebuildable cache)
+*.duckdb
+*.duckdb.wal
+.env

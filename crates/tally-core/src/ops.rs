@@ -21,7 +21,8 @@ pub enum ColumnKind {
     Number,
     /// Amounts in one currency, e.g. a "UAH" price column.
     Money { currency: Currency },
-    /// Computed for every row from a formula, e.g. `coalesce(to(UAH, USD), USD)`.
+    /// Computed for every row from a formula, e.g. `coalesce(to(price_uah, USD), price_usd)`.
+    /// Stored with column IDs (`coalesce(to(c4, USD), c5)`), so renames never break it.
     Calc { formula: String },
 }
 
@@ -31,10 +32,17 @@ impl ColumnKind {
     }
 }
 
-/// A column's definition. `total` adds the column up per section and for the sheet.
+/// A column's definition. Besides its invariant ID (`c4`, see [`Op::AddColumn`]) a
+/// column has a display name (`Price (UAH)`) and a variable name for formulas and
+/// SQL (`price_uah`; derived from the display name when left empty). `total` adds
+/// the column up per section and for the sheet.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnSpec {
+    /// Display name, shown in the header.
     pub name: String,
+    /// Variable name: lowercase letters, digits and `_`.
+    #[serde(default)]
+    pub var: String,
     #[serde(flatten)]
     pub kind: ColumnKind,
     #[serde(default)]
@@ -126,10 +134,10 @@ pub enum Op {
     /// Hand-set rates for this sheet; they win over every source.
     SetSheetFixedRates { sheet_id: String, rates: Vec<FixedRate> },
 
-    /// `position` orders columns; insert between two with the midpoint.
+    /// `position` orders columns; insert between two with the midpoint. Leave
+    /// `col_id` empty to get the next free ID (`c1`, `c2`, …); IDs are never reused.
     AddColumn { sheet_id: String, col_id: String, position: f64, spec: ColumnSpec },
-    /// Change a column's name, type or formula. Renaming also updates formulas
-    /// in other columns that refer to it.
+    /// Change a column's names, type or formula.
     UpdateColumn { sheet_id: String, col_id: String, spec: ColumnSpec },
     MoveColumn { sheet_id: String, col_id: String, position: f64 },
     /// Deleted columns are hidden but kept (with their values), so deleting can be undone.
@@ -174,7 +182,8 @@ mod tests {
             col_id: "c".into(),
             position: 3.0,
             spec: ColumnSpec {
-                name: "UAH".into(),
+                name: "Price (UAH)".into(),
+                var: "price_uah".into(),
                 kind: ColumnKind::Money { currency: Currency::new("UAH").unwrap() },
                 total: false,
             },
@@ -182,7 +191,7 @@ mod tests {
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(
             json,
-            r#"{"op":"add_column","sheet_id":"s","col_id":"c","position":3.0,"spec":{"name":"UAH","type":"money","currency":"UAH","total":false}}"#
+            r#"{"op":"add_column","sheet_id":"s","col_id":"c","position":3.0,"spec":{"name":"Price (UAH)","var":"price_uah","type":"money","currency":"UAH","total":false}}"#
         );
         assert_eq!(serde_json::from_str::<Op>(&json).unwrap(), op);
     }

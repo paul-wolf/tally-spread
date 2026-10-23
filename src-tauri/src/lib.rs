@@ -13,7 +13,7 @@ use tally_core::home::{machine_id, tally_home};
 use tally_core::library::Library;
 use tally_core::project::{read_settings, SheetInfo, FORMAT};
 use tally_core::sheet::SheetView;
-use tally_core::{formula, templates};
+use tally_core::templates;
 use tally_core::{Currency, Op, Project, ProjectSettings};
 use tauri::State;
 
@@ -83,7 +83,8 @@ fn list_projects(home: &Path) -> Vec<ProjectSummary> {
             let path = e.path();
             // Projects from an earlier version of Tally cannot be opened; skip them.
             let Ok(settings) = read_settings(&path) else { continue };
-            if settings.format < FORMAT {
+            // Format 2 is converted when opened; older ones are skipped.
+            if settings.format < FORMAT - 1 {
                 continue;
             }
             out.push(ProjectSummary { dir_name: e.file_name().to_string_lossy().into_owned(), name: settings.name });
@@ -328,10 +329,11 @@ fn create_sheet(state: State<AppState>, name: String, template: String) -> CmdRe
     inner.snapshot(Some(&id), vec![])
 }
 
-/// Check a column formula as it is typed: `None` if it parses, else the problem.
+/// Try a column formula as it is typed: its result on the first rows, or the problem.
 #[tauri::command]
-fn check_formula(formula: String) -> Option<String> {
-    formula::parse(&formula).err()
+fn preview_formula(state: State<AppState>, sheet_id: String, col_id: Option<String>, formula: String) -> CmdResult<Vec<String>> {
+    let inner = state.0.lock().map_err(err)?;
+    inner.project.preview_formula(&sheet_id, col_id.as_deref(), &formula, &inner.rates, today()).map_err(err)
 }
 
 #[tauri::command]
@@ -362,7 +364,7 @@ pub fn run() {
             import_rates,
             add_manual_rate,
             create_sheet,
-            check_formula,
+            preview_formula,
             export_xlsx
         ])
         .run(tauri::generate_context!())

@@ -1,15 +1,17 @@
-//! Column formulas: one expression computes a column for every row.
+//! Column formulas: one expression computes a column for every row; a column
+//! reference means that column's value on the same row.
 //!
 //! ```text
-//! coalesce(to(UAH, USD), USD)      unit cost in USD, from whichever price is filled in
-//! [Unit USD] * Qty                 line total
-//! to(Price, GBP)                   convert at the sheet's rates
-//! round([Unit USD] * 1.2, 2)
+//! coalesce(to(price_uah, USD), price_usd)   unit cost in USD from whichever price is filled in
+//! unit_usd * qty                             line total
+//! to(c8, EUR)                                columns by their ID work too
+//! [Price (UAH)] * 1.2                        or by display name, in brackets
 //! ```
 //!
-//! Names refer to columns (case-insensitive); names with spaces go in brackets.
-//! A column letter (`C`) also works. A three-letter code that is not a column is a
-//! currency. Amounts keep their currency: adding UAH to USD is an error, never a
+//! A column can be referred to by its ID (`c4`), its variable name (`price_uah`) or
+//! its display name in brackets (`[Price (UAH)]`). Three capital letters are a
+//! currency (`USD`). Formulas are stored with column IDs, so renaming a column never
+//! breaks one. Amounts keep their currency: adding UAH to USD is an error, never a
 //! silent mix; `to()` converts.
 
 use std::fmt;
@@ -22,7 +24,14 @@ use crate::money::Currency;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Num(Decimal),
+    /// A bare name as typed: a column ID, a variable name or a currency.
     Name(String),
+    /// A display name, typed in brackets.
+    Display(String),
+    /// A resolved column reference (column ID).
+    Col(String),
+    /// A resolved currency code.
+    Cur(Currency),
     Neg(Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
@@ -55,8 +64,8 @@ impl Value {
 
 /// What a formula can see while it is evaluated for one row.
 pub trait Context {
-    /// The value of a column in the current row, or `None` if no column has that name.
-    fn column(&self, name: &str) -> Option<Value>;
+    /// The value of a column (by ID) in the current row, or `None` if there is no such column.
+    fn column(&self, id: &str) -> Option<Value>;
     /// Convert an amount between currencies at the sheet's rates.
     fn convert(&self, amount: Decimal, from: &Currency, to: &Currency) -> Result<Decimal, String>;
 }
@@ -67,6 +76,7 @@ pub trait Context {
 enum Tok {
     Num(Decimal),
     Name(String),
+    Bracket(String),
     Op(char),
     LParen,
     RParen,
@@ -110,7 +120,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                 if name.trim().is_empty() {
                     return Err("empty [ ]".into());
                 }
-                out.push(Tok::Name(name.trim().to_string()));
+                out.push(Tok::Bracket(name.trim().to_string()));
                 i += end + 2;
             }
             c if c.is_ascii_digit() || c == '.' => {
@@ -187,6 +197,7 @@ impl Parser {
     fn primary(&mut self) -> Result<Expr, String> {
         match self.next() {
             Some(Tok::Num(n)) => Ok(Expr::Num(n)),
+            Some(Tok::Bracket(n)) => Ok(Expr::Display(n)),
             Some(Tok::LParen) => {
                 let e = self.expr()?;
                 match self.next() {
@@ -225,6 +236,7 @@ fn tok_text(t: &Tok) -> String {
     match t {
         Tok::Num(n) => n.to_string(),
         Tok::Name(n) => n.clone(),
+        Tok::Bracket(n) => format!("[{n}]"),
         Tok::Op(c) => c.to_string(),
         Tok::LParen => "(".into(),
         Tok::RParen => ")".into(),
@@ -232,7 +244,7 @@ fn tok_text(t: &Tok) -> String {
     }
 }
 
-const FUNCTIONS: &[&str] = &["to", "coalesce", "round", "abs", "min", "max", "if"];
+pub const FUNCTIONS: &[&str] = &["to", "coalesce", "round", "abs", "min", "max", "if"];
 
 pub fn parse(src: &str) -> Result<Expr, String> {
     let toks = tokenize(src)?;
@@ -272,60 +284,114 @@ fn check_calls(e: &Expr) -> Result<(), String> {
     }
 }
 
-/// Is this the currency argument of `to(x, CUR)`? It names a currency, not a column.
-fn is_currency_arg(f: &str, i: usize, a: &Expr) -> bool {
-    f == "to" && i == 1 && matches!(a, Expr::Name(n) if n.len() == 3 && Currency::new(n).is_ok())
+/// A column as formulas see it.
+#[derive(Clone, Debug)]
+pub struct ColRef {
+    /// Invariant ID, e.g. `c4`.
+    pub id: String,
+    /// Variable name, e.g. `price_uah`.
+    pub var: String,
+    /// Display name, e.g. `Price (UAH)`.
+    pub display: String,
 }
 
-/// Every column name a formula refers to.
-pub fn names(e: &Expr) -> Vec<String> {
+fn is_currency_code(n: &str) -> bool {
+    n.len() == 3 && n.chars().all(|c| c.is_ascii_uppercase())
+}
+
+/// Resolve names to column IDs and currencies: `c4` or `price_uah` (any case) or
+/// `[Price (UAH)]` is a column; three capital letters are a currency.
+pub fn resolve(e: &Expr, cols: &[ColRef]) -> Result<Expr, String> {
+    let by_name = |n: &str| -> Result<Expr, String> {
+        if let Some(c) = cols.iter().find(|c| c.id == n || c.var == n) {
+            return Ok(Expr::Col(c.id.clone()));
+        }
+        if is_currency_code(n) {
+            return Ok(Expr::Cur(Currency::new(n).map_err(|e| e.to_string())?));
+        }
+        if let Some(c) = cols.iter().find(|c| c.var.eq_ignore_ascii_case(n) || c.id.eq_ignore_ascii_case(n)) {
+            return Ok(Expr::Col(c.id.clone()));
+        }
+        Err(format!("no column called {n}"))
+    };
+    Ok(match e {
+        Expr::Name(n) => by_name(n)?,
+        Expr::Display(n) => match cols.iter().find(|c| c.display.eq_ignore_ascii_case(n)) {
+            Some(c) => Expr::Col(c.id.clone()),
+            None => return Err(format!("no column called [{n}]")),
+        },
+        Expr::Neg(a) => Expr::Neg(Box::new(resolve(a, cols)?)),
+        Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(resolve(a, cols)?), Box::new(resolve(b, cols)?)),
+        Expr::Call(f, args) => Expr::Call(f.clone(), args.iter().map(|a| resolve(a, cols)).collect::<Result<_, _>>()?),
+        other => other.clone(),
+    })
+}
+
+/// Resolve a formula written for the earlier format, where bare names were
+/// column names (case-insensitive) and only `to()`'s second argument was a currency.
+pub fn resolve_legacy(e: &Expr, cols: &[ColRef]) -> Result<Expr, String> {
+    fn walk(e: &Expr, cols: &[ColRef], currency_slot: bool) -> Result<Expr, String> {
+        Ok(match e {
+            Expr::Name(n) | Expr::Display(n) => {
+                if currency_slot && n.len() == 3 {
+                    if let Ok(c) = Currency::new(n) {
+                        return Ok(Expr::Cur(c));
+                    }
+                }
+                match cols.iter().find(|c| c.display.eq_ignore_ascii_case(n) || c.var.eq_ignore_ascii_case(n)) {
+                    Some(c) => Expr::Col(c.id.clone()),
+                    None => match Currency::new(n) {
+                        Ok(c) if n.len() == 3 => Expr::Cur(c),
+                        _ => return Err(format!("no column called {n}")),
+                    },
+                }
+            }
+            Expr::Neg(a) => Expr::Neg(Box::new(walk(a, cols, false)?)),
+            Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(walk(a, cols, false)?), Box::new(walk(b, cols, false)?)),
+            Expr::Call(f, args) => Expr::Call(
+                f.clone(),
+                args.iter().enumerate().map(|(i, a)| walk(a, cols, f == "to" && i == 1)).collect::<Result<_, _>>()?,
+            ),
+            other => other.clone(),
+        })
+    }
+    walk(e, cols, false)
+}
+
+/// Column IDs a resolved formula uses.
+pub fn refs(e: &Expr) -> Vec<String> {
     let mut out = Vec::new();
     fn walk(e: &Expr, out: &mut Vec<String>) {
         match e {
-            Expr::Name(n) => out.push(n.clone()),
+            Expr::Col(id) => out.push(id.clone()),
             Expr::Neg(a) => walk(a, out),
             Expr::Bin(_, a, b) => {
                 walk(a, out);
                 walk(b, out);
             }
-            Expr::Call(f, args) => {
-                for (i, a) in args.iter().enumerate() {
-                    if !is_currency_arg(f, i, a) {
-                        walk(a, out);
-                    }
-                }
-            }
-            Expr::Num(_) => {}
+            Expr::Call(_, args) => args.iter().for_each(|a| walk(a, out)),
+            _ => {}
         }
     }
     walk(e, &mut out);
     out
 }
 
-/// The formula with one column name replaced (case-insensitive), e.g. after a
-/// column rename. Currency codes in `to()` are left alone.
-pub fn rename(e: &Expr, old: &str, new: &str) -> Expr {
-    match e {
-        Expr::Name(n) if n.eq_ignore_ascii_case(old) => Expr::Name(new.to_string()),
-        Expr::Neg(a) => Expr::Neg(Box::new(rename(a, old, new))),
-        Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(rename(a, old, new)), Box::new(rename(b, old, new))),
-        Expr::Call(f, args) => Expr::Call(
-            f.clone(),
-            args.iter()
-                .enumerate()
-                .map(|(i, a)| if is_currency_arg(f, i, a) { a.clone() } else { rename(a, old, new) })
-                .collect(),
-        ),
-        other => other.clone(),
+/// A resolved formula written with variable names, for showing to people.
+pub fn render(e: &Expr, cols: &[ColRef]) -> String {
+    fn named(e: &Expr, cols: &[ColRef]) -> Expr {
+        match e {
+            Expr::Col(id) => match cols.iter().find(|c| &c.id == id) {
+                Some(c) => Expr::Name(c.var.clone()),
+                None => Expr::Name(id.clone()),
+            },
+            Expr::Neg(a) => Expr::Neg(Box::new(named(a, cols))),
+            Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(named(a, cols)), Box::new(named(b, cols))),
+            Expr::Call(f, args) => Expr::Call(f.clone(), args.iter().map(|a| named(a, cols)).collect()),
+            other => other.clone(),
+        }
     }
-}
-
-fn name_text(n: &str) -> String {
-    if n.chars().all(|c| c.is_alphanumeric() || c == '_') && !n.starts_with(|c: char| c.is_ascii_digit()) {
-        n.to_string()
-    } else {
-        format!("[{n}]")
-    }
+    named(e, cols).to_string()
 }
 
 impl fmt::Display for Expr {
@@ -339,7 +405,9 @@ impl fmt::Display for Expr {
         }
         match self {
             Expr::Num(n) => write!(f, "{n}"),
-            Expr::Name(n) => write!(f, "{}", name_text(n)),
+            Expr::Name(n) | Expr::Col(n) => write!(f, "{n}"),
+            Expr::Display(n) => write!(f, "[{n}]"),
+            Expr::Cur(c) => write!(f, "{c}"),
             Expr::Neg(a) => {
                 if prec(a) < 3 {
                     write!(f, "-({a})")
@@ -377,13 +445,10 @@ impl fmt::Display for Expr {
 pub fn eval(e: &Expr, ctx: &dyn Context) -> Value {
     match e {
         Expr::Num(n) => Value::Number(*n),
-        Expr::Name(n) => match ctx.column(n) {
-            Some(v) => v,
-            None => match Currency::new(n) {
-                Ok(c) if n.len() == 3 => Value::Currency(c),
-                _ => Value::Error(format!("no column named {n}")),
-            },
-        },
+        Expr::Col(id) => ctx.column(id).unwrap_or_else(|| Value::Error(format!("column {id} no longer exists"))),
+        Expr::Cur(c) => Value::Currency(c.clone()),
+        Expr::Name(n) => Value::Error(format!("no column called {n}")),
+        Expr::Display(n) => Value::Error(format!("no column called [{n}]")),
         Expr::Neg(a) => match eval(a, ctx) {
             Value::Number(n) => Value::Number(-n),
             Value::Money(n, c) => Value::Money(-n, c),
@@ -467,13 +532,7 @@ fn call(name: &str, args: &[Expr], ctx: &dyn Context) -> Value {
             first_error.map_or(Value::Empty, Value::Error)
         }
         "to" => {
-            // `to(UAH, USD)`: the second argument is the currency code itself, even
-            // when a column happens to be called USD.
-            let literal = match &args[1] {
-                Expr::Name(n) if n.len() == 3 => Currency::new(n).ok(),
-                _ => None,
-            };
-            let target = match literal.map(Value::Currency).unwrap_or_else(|| eval(&args[1], ctx)) {
+            let target = match eval(&args[1], ctx) {
                 Value::Currency(c) => c,
                 Value::Text(t) => match Currency::new(&t) {
                     Ok(c) => c,
@@ -561,8 +620,8 @@ mod tests {
     struct Row(HashMap<String, Value>);
 
     impl Context for Row {
-        fn column(&self, name: &str) -> Option<Value> {
-            self.0.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone())
+        fn column(&self, id: &str) -> Option<Value> {
+            self.0.get(id).cloned()
         }
         fn convert(&self, amount: Decimal, from: &Currency, to: &Currency) -> Result<Decimal, String> {
             match (from.code(), to.code()) {
@@ -576,60 +635,106 @@ mod tests {
         Currency::new(s).unwrap()
     }
 
+    fn cols() -> Vec<ColRef> {
+        [("c1", "item", "Item"), ("c4", "price_uah", "Price (UAH)"), ("c5", "price_usd", "Price (USD)"), ("c6", "unit_usd", "Unit (USD)"), ("c7", "qty", "Qty")]
+            .iter()
+            .map(|(id, var, display)| ColRef { id: id.to_string(), var: var.to_string(), display: display.to_string() })
+            .collect()
+    }
+
+    fn compile(src: &str) -> Expr {
+        resolve(&parse(src).unwrap(), &cols()).unwrap()
+    }
+
     fn row(pairs: &[(&str, Value)]) -> Row {
         Row(pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect())
     }
 
     #[test]
+    fn three_ways_to_refer_to_a_column() {
+        let a = compile("coalesce(to(price_uah, USD), price_usd)");
+        let b = compile("coalesce(to(c4, USD), c5)");
+        let d = compile("coalesce(to([Price (UAH)], USD), [price (usd)])");
+        assert_eq!(a, b);
+        assert_eq!(a, d);
+        // Stored with IDs, shown with variable names.
+        assert_eq!(a.to_string(), "coalesce(to(c4, USD), c5)");
+        assert_eq!(render(&a, &cols()), "coalesce(to(price_uah, USD), price_usd)");
+        // Case is forgiven for variable names, but capitals of three letters are a currency.
+        assert_eq!(compile("Qty * 2"), compile("qty * 2"));
+        assert!(matches!(compile("to(price_uah, USD)"), Expr::Call(_, ref a) if a[1] == Expr::Cur(c("USD"))));
+    }
+
+    #[test]
+    fn unknown_names_are_reported() {
+        assert_eq!(resolve(&parse("price * qty").unwrap(), &cols()).unwrap_err(), "no column called price");
+        assert!(resolve(&parse("[Nope]").unwrap(), &cols()).is_err());
+    }
+
+    #[test]
     fn unit_cost_from_either_price() {
-        let f = parse("coalesce(to(UAH, USD), USD)").unwrap();
-        let a = row(&[("UAH", Value::Money(dec!(3300), c("UAH"))), ("USD", Value::Empty)]);
+        let f = compile("coalesce(to(price_uah, USD), price_usd)");
+        let a = row(&[("c4", Value::Money(dec!(3300), c("UAH"))), ("c5", Value::Empty)]);
         assert_eq!(eval(&f, &a), Value::Money(dec!(75), c("USD")));
-        let b = row(&[("UAH", Value::Empty), ("USD", Value::Money(dec!(250), c("USD")))]);
+        let b = row(&[("c4", Value::Empty), ("c5", Value::Money(dec!(250), c("USD")))]);
         assert_eq!(eval(&f, &b), Value::Money(dec!(250), c("USD")));
     }
 
     #[test]
-    fn line_total_and_brackets() {
-        let f = parse("=[Unit USD] * Qty").unwrap();
-        let r = row(&[("Unit USD", Value::Money(dec!(30.80), c("USD"))), ("qty", Value::Number(dec!(4)))]);
+    fn missing_rate_is_not_swallowed() {
+        let f = compile("coalesce(to(price_uah, EUR), price_usd)");
+        let a = row(&[("c4", Value::Money(dec!(100), c("UAH"))), ("c5", Value::Empty)]);
+        assert!(matches!(eval(&f, &a), Value::Error(e) if e.contains("UAH→EUR")));
+    }
+
+    #[test]
+    fn line_total_and_empty_quantity() {
+        let f = compile("= unit_usd * qty");
+        let r = row(&[("c6", Value::Money(dec!(30.80), c("USD"))), ("c7", Value::Number(dec!(4)))]);
         assert_eq!(eval(&f, &r), Value::Money(dec!(123.20), c("USD")));
-        let empty = row(&[("Unit USD", Value::Money(dec!(30.80), c("USD"))), ("qty", Value::Empty)]);
+        let empty = row(&[("c6", Value::Money(dec!(30.80), c("USD"))), ("c7", Value::Empty)]);
         assert_eq!(eval(&f, &empty), Value::Empty);
     }
 
     #[test]
     fn mixing_currencies_is_an_error() {
-        let f = parse("UAH + USD").unwrap();
-        let r = row(&[("UAH", Value::Money(dec!(1), c("UAH"))), ("USD", Value::Money(dec!(1), c("USD")))]);
+        let f = compile("price_uah + price_usd");
+        let r = row(&[("c4", Value::Money(dec!(1), c("UAH"))), ("c5", Value::Money(dec!(1), c("USD")))]);
         assert!(matches!(eval(&f, &r), Value::Error(e) if e.contains("convert")));
     }
 
     #[test]
     fn parse_errors_are_readable() {
         assert!(parse("").is_err());
-        assert!(parse("Qty *").unwrap_err().contains("too soon"));
-        assert!(parse("sum(Qty)").unwrap_err().contains("unknown function"));
-        assert!(parse("to(UAH)").unwrap_err().contains("arguments"));
+        assert!(parse("qty *").unwrap_err().contains("too soon"));
+        assert!(parse("sum(qty)").unwrap_err().contains("unknown function"));
+        assert!(parse("to(qty)").unwrap_err().contains("arguments"));
         assert!(parse("(1 + 2").unwrap_err().contains(")"));
     }
 
     #[test]
-    fn rename_and_display() {
-        let f = parse("coalesce(to(UAH, USD), [Price USD]) * qty").unwrap();
-        let g = rename(&f, "price usd", "USD price");
-        // Renaming a column called USD leaves the currency code in to() alone.
-        let h = rename(&parse("coalesce(to(UAH, USD), USD)").unwrap(), "USD", "US price");
-        assert_eq!(h.to_string(), "coalesce(to(UAH, USD), [US price])");
-        assert_eq!(g.to_string(), "coalesce(to(UAH, USD), [USD price]) * qty");
+    fn legacy_formulas_resolve_by_display_name() {
+        let legacy = [("c1", "uah", "UAH"), ("c2", "usd", "USD"), ("c3", "unit_usd", "Unit USD"), ("c4", "qty", "Qty")]
+            .iter()
+            .map(|(id, var, display)| ColRef { id: id.to_string(), var: var.to_string(), display: display.to_string() })
+            .collect::<Vec<_>>();
+        let f = resolve_legacy(&parse("coalesce(to(UAH, USD), USD)").unwrap(), &legacy).unwrap();
+        assert_eq!(f.to_string(), "coalesce(to(c1, USD), c2)");
+        let g = resolve_legacy(&parse("[Unit USD] * Qty").unwrap(), &legacy).unwrap();
+        assert_eq!(g.to_string(), "c3 * c4");
+    }
+
+    #[test]
+    fn display_round_trip() {
         assert_eq!(parse("(a - b) - (c - d)").unwrap().to_string(), "a - b - (c - d)");
-        assert_eq!(parse(&g.to_string()).unwrap(), g);
+        let f = compile("round(price_uah / 3)");
+        assert_eq!(resolve(&parse(&f.to_string()).unwrap(), &cols()).unwrap(), f);
     }
 
     #[test]
     fn rounding_uses_currency_decimals() {
-        let f = parse("round(UAH / 3)").unwrap();
-        let r = row(&[("UAH", Value::Money(dec!(10), c("UAH")))]);
+        let f = compile("round(price_uah / 3)");
+        let r = row(&[("c4", Value::Money(dec!(10), c("UAH")))]);
         assert_eq!(eval(&f, &r), Value::Money(dec!(3.33), c("UAH")));
     }
 }

@@ -33,7 +33,7 @@ use crate::ops::{ColumnKind, ColumnSpec, FixedRate, LogEntry, Op, RateMode, RowK
 use crate::{Error, Result};
 
 /// Version of the project format. Projects made by an older version cannot be opened.
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ProjectSettings {
@@ -165,6 +165,9 @@ impl Project {
     pub fn open(dir: impl Into<PathBuf>, machine: &str) -> Result<Self> {
         let dir = dir.into();
         let settings = read_settings(&dir)?;
+        if settings.format == 2 {
+            return Self::migrate_v2(dir, settings, machine);
+        }
         if settings.format < FORMAT {
             return Err(Error::InvalidValue(format!(
                 "{} was made by an earlier version of Tally and cannot be opened",
@@ -418,52 +421,29 @@ impl Project {
 
             Op::AddColumn { sheet_id, col_id, position, spec } => {
                 self.sheet(sheet_id)?;
-                if self.column_row(sheet_id, col_id)?.is_some() {
+                let col_id = if col_id.is_empty() { self.next_col_id(sheet_id)? } else { col_id.clone() };
+                if self.column_row(sheet_id, &col_id)?.is_some() {
                     return Err(Error::InvalidValue(format!("column {col_id} already exists")));
                 }
                 finite(*position)?;
-                let spec = self.check_spec(sheet_id, None, spec)?;
+                let spec = self.check_spec(sheet_id, &col_id, spec)?;
                 self.conn.execute(
                     "INSERT INTO columns (sheet_id, col_id, position, name, spec) VALUES (?, ?, ?, ?, ?)",
                     params![sheet_id, col_id, position, spec.name, serde_json::to_string(&spec)?],
                 )?;
                 Ok((
                     Op::AddColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), position: *position, spec },
-                    Op::SetColumnDeleted { sheet_id: sheet_id.clone(), col_id: col_id.clone(), deleted: true },
+                    Op::SetColumnDeleted { sheet_id: sheet_id.clone(), col_id, deleted: true },
                 ))
             }
             Op::UpdateColumn { sheet_id, col_id, spec } => {
                 let old = self.column(sheet_id, col_id)?;
-                let spec = self.check_spec(sheet_id, Some(col_id), spec)?;
+                let spec = self.check_spec(sheet_id, col_id, spec)?;
                 self.write_spec(sheet_id, col_id, &spec)?;
-                let mut done = vec![Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), spec: spec.clone() }];
-                let mut undo = vec![Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), spec: old.spec.clone() }];
-
-                // Keep other columns' formulas pointing at this column after a rename.
-                if old.spec.name != spec.name {
-                    for other in self.columns(sheet_id)? {
-                        if other.col_id == *col_id {
-                            continue;
-                        }
-                        if let ColumnKind::Calc { formula: src } = &other.spec.kind {
-                            let Ok(expr) = formula::parse(src) else { continue };
-                            if !formula::names(&expr).iter().any(|n| n.eq_ignore_ascii_case(&old.spec.name)) {
-                                continue;
-                            }
-                            let new_src = formula::rename(&expr, &old.spec.name, &spec.name).to_string();
-                            let new_spec = ColumnSpec { kind: ColumnKind::Calc { formula: new_src }, ..other.spec.clone() };
-                            self.write_spec(sheet_id, &other.col_id, &new_spec)?;
-                            done.push(Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: other.col_id.clone(), spec: new_spec });
-                            undo.push(Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: other.col_id.clone(), spec: other.spec.clone() });
-                        }
-                    }
-                }
-                undo.reverse();
-                if done.len() == 1 {
-                    Ok((done.pop().unwrap(), undo.pop().unwrap()))
-                } else {
-                    Ok((Op::Batch { ops: done }, Op::Batch { ops: undo }))
-                }
+                Ok((
+                    Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), spec },
+                    Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), spec: old.spec },
+                ))
             }
             Op::MoveColumn { sheet_id, col_id, position } => {
                 finite(*position)?;
@@ -479,10 +459,12 @@ impl Project {
                     .column_row(sheet_id, col_id)?
                     .ok_or_else(|| Error::NotFound(format!("column {col_id}")))?;
                 if !deleted && old {
-                    // Restoring: its name must still be free.
+                    // Restoring: its names must still be free.
                     let spec = self.column_spec_any(sheet_id, col_id)?;
-                    if self.name_taken(sheet_id, Some(col_id), &spec.name)? {
-                        return Err(Error::InvalidValue(format!("another column is already called {}", spec.name)));
+                    if let Some(clash) = self.columns(sheet_id)?.iter().find(|c| {
+                        c.spec.name.eq_ignore_ascii_case(&spec.name) || (!spec.var.is_empty() && c.spec.var == spec.var)
+                    }) {
+                        return Err(Error::InvalidValue(format!("column {} already uses that name", clash.col_id)));
                     }
                 }
                 self.conn.execute(
@@ -573,33 +555,71 @@ impl Project {
         }
     }
 
-    /// Validate a column spec; names must be unique (formulas refer to them).
-    fn check_spec(&self, sheet_id: &str, col_id: Option<&str>, spec: &ColumnSpec) -> Result<ColumnSpec> {
+    /// The next column ID for a sheet: `c` + one more than any ID it ever had.
+    fn next_col_id(&self, sheet_id: &str) -> Result<String> {
+        let mut stmt = self.conn.prepare("SELECT col_id FROM columns WHERE sheet_id = ?")?;
+        let ids = stmt.query_map(params![sheet_id], |r| r.get::<_, String>(0))?;
+        let mut max = 0u32;
+        for id in ids {
+            if let Some(n) = id?.strip_prefix('c').and_then(|n| n.parse::<u32>().ok()) {
+                max = max.max(n);
+            }
+        }
+        Ok(format!("c{}", max + 1))
+    }
+
+    /// How formulas see the sheet's columns.
+    pub fn col_refs(&self, sheet_id: &str) -> Result<Vec<formula::ColRef>> {
+        Ok(self
+            .columns(sheet_id)?
+            .into_iter()
+            .map(|c| formula::ColRef { id: c.col_id, var: c.spec.var, display: c.spec.name })
+            .collect())
+    }
+
+    /// Validate and normalise a column spec: display and variable names must be
+    /// unique in the sheet; formulas are checked and stored with column IDs.
+    fn check_spec(&self, sheet_id: &str, col_id: &str, spec: &ColumnSpec) -> Result<ColumnSpec> {
         let name = non_empty(&spec.name, "column name")?;
         if name.contains(['[', ']']) {
-            return Err(Error::InvalidValue("column names cannot contain [ or ]".into()));
+            return Err(Error::InvalidValue("display names cannot contain [ or ]".into()));
         }
-        if self.name_taken(sheet_id, col_id, &name)? {
-            return Err(Error::InvalidValue(format!("another column is already called {name}")));
+        let others: Vec<ColumnInfo> = self.columns(sheet_id)?.into_iter().filter(|c| c.col_id != col_id).collect();
+        if let Some(c) = others.iter().find(|c| c.spec.name.eq_ignore_ascii_case(&name)) {
+            return Err(Error::InvalidValue(format!("column {} is already called {name}", c.col_id)));
         }
+        let var = if spec.var.trim().is_empty() {
+            let base = var_from_name(&name);
+            let mut v = base.clone();
+            let mut n = 2;
+            while others.iter().any(|c| c.spec.var == v) {
+                v = format!("{base}_{n}");
+                n += 1;
+            }
+            v
+        } else {
+            let v = spec.var.trim().to_string();
+            check_var(&v)?;
+            if let Some(c) = others.iter().find(|c| c.spec.var == v) {
+                return Err(Error::InvalidValue(format!("column {} already has the variable name {v}", c.col_id)));
+            }
+            v
+        };
         let kind = match &spec.kind {
             ColumnKind::Calc { formula: src } => {
                 let expr = formula::parse(src).map_err(|e| Error::InvalidValue(format!("formula: {e}")))?;
-                if formula::names(&expr).iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                let mut cols = self.col_refs(sheet_id)?;
+                cols.retain(|c| c.id != col_id);
+                cols.push(formula::ColRef { id: col_id.to_string(), var: var.clone(), display: name.clone() });
+                let resolved = formula::resolve(&expr, &cols).map_err(|e| Error::InvalidValue(format!("formula: {e}")))?;
+                if formula::refs(&resolved).iter().any(|r| r == col_id) {
                     return Err(Error::InvalidValue(format!("the formula for {name} refers to itself")));
                 }
-                ColumnKind::Calc { formula: src.trim().trim_start_matches('=').trim().to_string() }
+                ColumnKind::Calc { formula: resolved.to_string() }
             }
             other => other.clone(),
         };
-        Ok(ColumnSpec { name, kind, total: spec.total })
-    }
-
-    fn name_taken(&self, sheet_id: &str, col_id: Option<&str>, name: &str) -> Result<bool> {
-        Ok(self
-            .columns(sheet_id)?
-            .iter()
-            .any(|c| Some(c.col_id.as_str()) != col_id && c.spec.name.eq_ignore_ascii_case(name)))
+        Ok(ColumnSpec { name, var, kind, total: spec.total })
     }
 
     fn write_spec(&self, sheet_id: &str, col_id: &str, spec: &ColumnSpec) -> Result<()> {
@@ -608,6 +628,92 @@ impl Project {
             params![spec.name, serde_json::to_string(spec)?, sheet_id, col_id],
         )?;
         Ok(())
+    }
+
+    /// Convert a project from format 2 (columns had random IDs and formulas used
+    /// display names) to format 3 (IDs c1, c2…, variable names, formulas stored by
+    /// ID). The old log is kept in `ops-v2-backup/`.
+    fn migrate_v2(dir: PathBuf, mut settings: ProjectSettings, machine: &str) -> Result<Self> {
+        let probe = Self {
+            dir: dir.clone(),
+            machine: machine.to_string(),
+            settings: settings.clone(),
+            conn: Connection::open_in_memory()?,
+            last_id: Ulid::nil(),
+            entries_applied: 0,
+            undo: vec![],
+            redo: vec![],
+            replay_warnings: vec![],
+        };
+        let (entries, _) = probe.read_log()?;
+        drop(probe);
+
+        let backup = dir.join("ops-v2-backup");
+        if !backup.exists() {
+            fs::rename(dir.join("ops"), &backup)?;
+        } else {
+            fs::remove_dir_all(dir.join("ops"))?;
+        }
+        fs::create_dir_all(dir.join("ops"))?;
+        settings.format = FORMAT;
+        fs::write(dir.join("project.json"), serde_json::to_string_pretty(&settings)?)?;
+        let mut p = Self::open(&dir, machine)?;
+
+        fn flatten(op: Op, out: &mut Vec<Op>) {
+            match op {
+                Op::Batch { ops } => ops.into_iter().for_each(|o| flatten(o, out)),
+                o => out.push(o),
+            }
+        }
+        let mut ops = Vec::new();
+        for e in entries {
+            flatten(e.op, &mut ops);
+        }
+        // old column ID -> new column ID, per sheet
+        let mut ids: HashMap<(String, String), String> = HashMap::new();
+        let mut warnings = Vec::new();
+        for op in ops {
+            let map = |ids: &HashMap<(String, String), String>, sheet: &str, col: &str| {
+                ids.get(&(sheet.to_string(), col.to_string())).cloned().unwrap_or_else(|| col.to_string())
+            };
+            let legacy_spec = |p: &Project, sheet: &str, mut spec: ColumnSpec| -> Result<ColumnSpec> {
+                if let ColumnKind::Calc { formula: src } = &spec.kind {
+                    let cols = p.col_refs(sheet)?;
+                    let expr = formula::parse(src).map_err(Error::InvalidValue)?;
+                    let resolved = formula::resolve_legacy(&expr, &cols).map_err(Error::InvalidValue)?;
+                    spec.kind = ColumnKind::Calc { formula: resolved.to_string() };
+                }
+                Ok(spec)
+            };
+            let translated = match op {
+                Op::AddColumn { sheet_id, col_id, position, spec } => {
+                    let new_id = p.next_col_id(&sheet_id).unwrap_or_else(|_| col_id.clone());
+                    ids.insert((sheet_id.clone(), col_id), new_id.clone());
+                    legacy_spec(&p, &sheet_id, spec).map(|spec| Op::AddColumn { sheet_id, col_id: new_id, position, spec })
+                }
+                Op::UpdateColumn { sheet_id, col_id, spec } => {
+                    let col_id = map(&ids, &sheet_id, &col_id);
+                    legacy_spec(&p, &sheet_id, spec).map(|spec| Op::UpdateColumn { sheet_id, col_id, spec })
+                }
+                Op::MoveColumn { sheet_id, col_id, position } => {
+                    Ok(Op::MoveColumn { col_id: map(&ids, &sheet_id, &col_id), sheet_id, position })
+                }
+                Op::SetColumnDeleted { sheet_id, col_id, deleted } => {
+                    Ok(Op::SetColumnDeleted { col_id: map(&ids, &sheet_id, &col_id), sheet_id, deleted })
+                }
+                Op::SetCell { sheet_id, row_id, col_id, value } => {
+                    Ok(Op::SetCell { col_id: map(&ids, &sheet_id, &col_id), sheet_id, row_id, value })
+                }
+                other => Ok(other),
+            };
+            match translated.and_then(|op| p.apply_logged(op)) {
+                Ok(_) => {}
+                Err(e) => warnings.push(format!("while converting to the new format: {e}")),
+            }
+        }
+        p.undo.clear();
+        p.replay_warnings.extend(warnings);
+        Ok(p)
     }
 
     // ---------------------------------------------------------------- reading
@@ -766,6 +872,43 @@ impl Project {
     }
 }
 
+/// A variable name from a display name: "Price (UAH)" -> price_uah.
+pub fn var_from_name(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.trim().to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    let out = if out.is_empty() { "col".to_string() } else { out };
+    let out = if out.starts_with(|c: char| c.is_ascii_digit()) || is_reserved_var(&out) { format!("col_{out}") } else { out };
+    out
+}
+
+fn is_reserved_var(v: &str) -> bool {
+    let id_like = |p: char| v.strip_prefix(p).is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    id_like('c') || id_like('r') || formula::FUNCTIONS.contains(&v)
+}
+
+/// Variable names: lowercase letters, digits and `_`, starting with a letter; not
+/// a column or row ID (`c4`, `r2`) or a function name.
+pub fn check_var(v: &str) -> Result<()> {
+    let ok = v.starts_with(|c: char| c.is_ascii_lowercase())
+        && v.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !ok {
+        return Err(Error::InvalidValue(format!(
+            "variable name {v:?}: use lowercase letters, digits and _, starting with a letter"
+        )));
+    }
+    if is_reserved_var(v) {
+        return Err(Error::InvalidValue(format!("variable name {v:?} is reserved (column IDs, row IDs and functions)")));
+    }
+    Ok(())
+}
+
 /// Normalise a typed or pasted value for a column, or say why it does not fit.
 pub fn normalize_cell(spec: &ColumnSpec, v: &str) -> Result<String> {
     match &spec.kind {
@@ -830,7 +973,7 @@ pub(crate) mod tests {
     }
 
     pub fn spec(name: &str, kind: K, total: bool) -> ColumnSpec {
-        ColumnSpec { name: name.into(), kind, total }
+        ColumnSpec { name: name.into(), var: String::new(), kind, total }
     }
 
     /// A project with one sheet "s" laid out like a spending list.
@@ -840,9 +983,9 @@ pub(crate) mod tests {
             ("item", spec("Item", K::Text, false)),
             ("uah", spec("UAH", K::Money { currency: cur("UAH") }, false)),
             ("usd", spec("USD", K::Money { currency: cur("USD") }, false)),
-            ("unit", spec("Unit USD", K::Calc { formula: "coalesce(to(UAH, USD), USD)".into() }, false)),
+            ("unit", spec("Unit USD", K::Calc { formula: "coalesce(to(uah, USD), usd)".into() }, false)),
             ("qty", spec("Qty", K::Number, false)),
-            ("total", spec("Total USD", K::Calc { formula: "[Unit USD] * Qty".into() }, true)),
+            ("total", spec("Total USD", K::Calc { formula: "[Unit USD] * qty".into() }, true)),
         ];
         let mut ops = vec![Op::CreateSheet { sheet_id: "s".into(), name: "Drone".into() }];
         for (i, (id, s)) in cols.into_iter().enumerate() {
@@ -908,17 +1051,16 @@ pub(crate) mod tests {
             .apply(Op::AddColumn { sheet_id: "s".into(), col_id: "x".into(), position: 9.0, spec: spec("qty", K::Number, false) })
             .is_err());
 
-        // Renaming Unit USD updates the Total USD formula, and undo restores both.
+        // Formulas are stored by ID, so renaming Unit USD changes nothing in Total USD.
+        assert_eq!(p.column("s", "total").unwrap().spec.kind, K::Calc { formula: "unit * qty".into() });
         p.apply(Op::UpdateColumn {
             sheet_id: "s".into(),
             col_id: "unit".into(),
-            spec: spec("Each USD", K::Calc { formula: "coalesce(to(UAH, USD), USD)".into() }, false),
+            spec: ColumnSpec { name: "Each (USD)".into(), var: "each_usd".into(), kind: K::Calc { formula: "coalesce(to(uah, USD), usd)".into() }, total: false },
         })
         .unwrap();
-        let total = p.column("s", "total").unwrap();
-        assert_eq!(total.spec.kind, K::Calc { formula: "[Each USD] * Qty".into() });
-        p.undo().unwrap();
-        assert_eq!(p.column("s", "total").unwrap().spec.kind, K::Calc { formula: "[Unit USD] * Qty".into() });
+        assert_eq!(p.column("s", "total").unwrap().spec.kind, K::Calc { formula: "unit * qty".into() });
+        assert_eq!(p.column("s", "unit").unwrap().spec.var, "each_usd");
 
         // Delete and restore a column.
         p.apply(Op::SetColumnDeleted { sheet_id: "s".into(), col_id: "link".into(), deleted: true }).unwrap();
@@ -937,10 +1079,11 @@ pub(crate) mod tests {
             position: 99.0,
             spec: spec("X", K::Calc { formula: f.into() }, false),
         };
-        assert!(p.apply(add("Qty *")).is_err());
-        assert!(p.apply(add("X + 1")).is_err(), "refers to itself");
+        assert!(p.apply(add("qty *")).is_err());
+        assert!(p.apply(add("x + 1")).is_err(), "refers to itself");
+        assert!(p.apply(add("price * 2")).is_err(), "no such column");
         assert!(p.apply(add("= Qty * 2")).is_ok());
-        assert_eq!(p.column("s", "x").unwrap().spec.kind, K::Calc { formula: "Qty * 2".into() });
+        assert_eq!(p.column("s", "x").unwrap().spec.kind, K::Calc { formula: "qty * 2".into() });
     }
 
     #[test]
@@ -966,6 +1109,81 @@ pub(crate) mod tests {
         .unwrap();
         let err = Project::open(tmp.path(), "mac").err().unwrap().to_string();
         assert!(err.contains("earlier version"), "{err}");
+    }
+
+    #[test]
+    fn ids_and_variable_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = spending_project(tmp.path());
+        let add = |name: &str, var: &str| Op::AddColumn {
+            sheet_id: "s".into(),
+            col_id: String::new(),
+            position: 50.0,
+            spec: ColumnSpec { name: name.into(), var: var.into(), kind: K::Text, total: false },
+        };
+        p.apply(add("Price (EUR)", "")).unwrap();
+        p.apply(add("Price (EUR) 2", "")).unwrap();
+        let cols = p.columns("s").unwrap();
+        let a = &cols[cols.len() - 2];
+        let b = &cols[cols.len() - 1];
+        assert_eq!((a.col_id.as_str(), a.spec.var.as_str()), ("c1", "price_eur"));
+        assert_eq!((b.col_id.as_str(), b.spec.var.as_str()), ("c2", "price_eur_2"));
+        // IDs are never reused, even after a delete.
+        p.apply(Op::SetColumnDeleted { sheet_id: "s".into(), col_id: "c2".into(), deleted: true }).unwrap();
+        p.apply(add("Other", "")).unwrap();
+        assert!(p.columns("s").unwrap().iter().any(|c| c.col_id == "c3"));
+        // Bad and reserved variable names.
+        assert!(p.apply(add("Bad", "Bad Name")).is_err());
+        assert!(p.apply(add("Bad", "c9")).is_err());
+        assert!(p.apply(add("Bad", "round")).is_err());
+        assert_eq!(var_from_name("Price (USD)"), "price_usd");
+        assert_eq!(var_from_name("2024 total"), "col_2024_total");
+        assert_eq!(var_from_name("C4"), "col_c4");
+    }
+
+    #[test]
+    fn format_2_projects_are_converted() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("ops")).unwrap();
+        fs::write(
+            tmp.path().join("project.json"),
+            r#"{"format":2,"name":"Old","reporting_currency":"GBP","rate_sources":["ecb","nbu"]}"#,
+        )
+        .unwrap();
+        let money = |c: &str| format!(r#""type":"money","currency":"{c}""#);
+        let lines = [
+            r#"{"op":"batch","ops":[{"op":"create_sheet","sheet_id":"s","name":"Spending"},"#.to_string()
+                + &format!(r#"{{"op":"add_column","sheet_id":"s","col_id":"01AAA","position":1.0,"spec":{{"name":"Item","type":"text","total":false}}}},"#)
+                + &format!(r#"{{"op":"add_column","sheet_id":"s","col_id":"01BBB","position":2.0,"spec":{{"name":"UAH",{},"total":false}}}},"#, money("UAH"))
+                + &format!(r#"{{"op":"add_column","sheet_id":"s","col_id":"01CCC","position":3.0,"spec":{{"name":"USD",{},"total":false}}}},"#, money("USD"))
+                + r#"{"op":"add_column","sheet_id":"s","col_id":"01DDD","position":4.0,"spec":{"name":"Unit USD","type":"calc","formula":"coalesce(to(UAH, USD), USD)","total":false}},"#
+                + r#"{"op":"add_column","sheet_id":"s","col_id":"01EEE","position":5.0,"spec":{"name":"Qty","type":"number","total":false}},"#
+                + r#"{"op":"add_column","sheet_id":"s","col_id":"01FFF","position":6.0,"spec":{"name":"Total USD","type":"calc","formula":"[Unit USD] * Qty","total":true}}]}"#,
+            r#"{"op":"insert_row","sheet_id":"s","row_id":"r1","position":1.0}"#.to_string(),
+            r#"{"op":"set_cell","sheet_id":"s","row_id":"r1","col_id":"01BBB","value":"4400"}"#.to_string(),
+            r#"{"op":"set_cell","sheet_id":"s","row_id":"r1","col_id":"01EEE","value":"2"}"#.to_string(),
+        ];
+        let log: String = lines
+            .iter()
+            .enumerate()
+            .map(|(i, op)| format!(r#"{{"id":"01J00000000000000000000{i:03}","ts":"2026-10-22T10:00:00Z","machine":"mac","op":{op}}}"#) + "\n")
+            .collect();
+        fs::write(tmp.path().join("ops/mac.jsonl"), log).unwrap();
+
+        let p = Project::open(tmp.path(), "mac").unwrap();
+        assert!(p.replay_warnings().is_empty(), "{:?}", p.replay_warnings());
+        let cols = p.columns("s").unwrap();
+        let ids: Vec<_> = cols.iter().map(|c| (c.col_id.as_str(), c.spec.var.as_str())).collect();
+        assert_eq!(ids, [("c1", "item"), ("c2", "uah"), ("c3", "usd"), ("c4", "unit_usd"), ("c5", "qty"), ("c6", "total_usd")]);
+        assert_eq!(cols[3].spec.kind, K::Calc { formula: "coalesce(to(c2, USD), c3)".into() });
+        assert_eq!(cols[5].spec.kind, K::Calc { formula: "c4 * c5".into() });
+        assert_eq!(p.cells("s").unwrap()[&("r1".into(), "c2".into())], "4400");
+        assert_eq!(read_settings(tmp.path()).unwrap().format, FORMAT);
+        assert!(tmp.path().join("ops-v2-backup/mac.jsonl").exists());
+        // Opens normally afterwards.
+        drop(p);
+        let again = Project::open(tmp.path(), "mac").unwrap();
+        assert_eq!(again.columns("s").unwrap().len(), 6);
     }
 
     #[test]

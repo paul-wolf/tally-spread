@@ -12,13 +12,13 @@ Status: early but usable. Sheets with your own columns, calculated columns, sect
 
 ## What works now
 
-- **Your own columns.** Columns are lettered A, B, C… and named as you like. Insert left or right, delete (undoable), drag to reorder, rename, change type. Each column has a type: **Text**, **Number**, **Link**, **Money** in one currency (e.g. a "UAH" column), or **Calculated**.
-- **Calculated columns.** One formula for the whole column, using column names:
-  - `coalesce(to(UAH, USD), USD)`: unit cost in USD from whichever price is filled in
-  - `[Unit USD] * Qty`: line total
-  - `to([Total USD], EUR)`: convert at the sheet's rates
+- **Your own columns.** Every column has an invariant ID (`c1`, `c2`, … never reused), a display name (`Price (UAH)`) and a variable name for formulas and SQL (`price_uah`, derived from the display name unless you set it). Insert left or right, delete (undoable), drag to reorder, rename, change type. Types: **Text**, **Number**, **Link**, **Money** in one currency, or **Calculated**.
+- **Calculated columns.** One formula for the whole column; a column reference means that column on the same row:
+  - `coalesce(to(price_uah, USD), price_usd)`: unit cost in USD from whichever price is filled in
+  - `unit_usd * qty`: line total
+  - `to(c8, EUR)` or `[Total (USD)] * 1.2`: columns by ID or display name work too
 
-  Functions: `to`, `coalesce`, `round`, `abs`, `min`, `max`, `if`. Amounts keep their currency: adding UAH to USD is an error, never a silent mix. Renaming a column updates the formulas that use it. There are no per-cell formulas.
+  Functions: `to`, `coalesce`, `round`, `abs`, `min`, `max`, `if`. Three capital letters are a currency (`USD`). Formulas are stored by column ID, so renaming never breaks one. Amounts keep their currency: adding UAH to USD is an error, never a silent mix. The column dialog previews the result as you type. There are no per-cell formulas.
 - **Sections.** Any row can be a section heading; columns marked "Add up" get a subtotal on the heading and a sheet total.
 - **Exchange rates.** ECB (preferred), NBU and HMRC monthly, updated automatically. ECB does not publish hryvnia, so NBU covers UAH. Per sheet: preferred source, live or locked to a date, and fixed rates of your own (e.g. 1 USD = 44.92 UAH) that win over every source. The rates used are listed under the totals.
 - **Exact money**: decimal arithmetic, per-currency rounding; amounts typed as `₴12 499,50`, `$ 71.50`, `1,234.56` or `12.50 EUR`.

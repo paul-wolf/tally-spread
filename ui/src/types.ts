@@ -11,7 +11,8 @@ export type ColumnKind =
   | { type: "money"; currency: string }
   | { type: "calc"; formula: string };
 
-export type ColumnSpec = { name: string; total: boolean } & ColumnKind;
+/** name = display name ("Price (UAH)"); var = variable name ("price_uah"; empty = derive). */
+export type ColumnSpec = { name: string; var: string; total: boolean } & ColumnKind;
 
 export interface FixedRate {
   base: string;
@@ -37,10 +38,15 @@ export type Op =
   | { op: "batch"; ops: Op[] };
 
 export type ColumnView = {
+  /** Invariant ID: c1, c2, … */
   col_id: string;
-  letter: string;
   position: number;
+  /** Display name. */
   name: string;
+  /** Variable name for formulas and SQL. */
+  var: string;
+  /** Calculated columns: the formula written with variable names. */
+  formula_display: string | null;
   total: boolean;
   error: string | null;
 } & ColumnKind;

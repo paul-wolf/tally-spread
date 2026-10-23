@@ -1,22 +1,47 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import type { ColumnSpec, ColumnView } from "./types";
 
 type Kind = ColumnSpec["type"];
 
-const KINDS: { kind: Kind; label: string; hint: string }[] = [
-  { kind: "text", label: "Text", hint: "Names, notes" },
-  { kind: "number", label: "Number", hint: "Quantities" },
-  { kind: "money", label: "Money", hint: "Amounts in one currency" },
-  { kind: "calc", label: "Calculated", hint: "A formula for every row" },
-  { kind: "link", label: "Link", hint: "Web addresses" },
+const KINDS: { kind: Kind; label: string }[] = [
+  { kind: "text", label: "Text" },
+  { kind: "number", label: "Number" },
+  { kind: "money", label: "Money" },
+  { kind: "calc", label: "Calculated" },
+  { kind: "link", label: "Link" },
 ];
 
+/** Examples written with this sheet's own column names where possible. */
+function examples(cols: ColumnView[]): [string, string][] {
+  const money = cols.filter((c) => c.type === "money" || c.type === "calc").map((c) => c.var);
+  const num = cols.find((c) => c.type === "number")?.var ?? "qty";
+  const a = money[0] ?? "price_uah";
+  const b = money[1] ?? "price_usd";
+  return [
+    [`${a} * ${num}`, "multiply two columns on the same row"],
+    [`to(${a}, USD)`, "convert to dollars at the sheet's rates"],
+    [`coalesce(${a}, ${b})`, `${a} if it's filled in, otherwise ${b}`],
+    [`round(${a} * 1.2, 2)`, "round to 2 decimals"],
+  ];
+}
+
+/** "Price (UAH)" -> price_uah, as the engine derives it. */
+export function varFromName(name: string): string {
+  let v = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  if (!v) v = "col";
+  if (/^\d/.test(v) || /^[cr]\d+$/.test(v)) v = `col_${v}`;
+  return v;
+}
+
+const VAR_OK = /^[a-z][a-z0-9_]*$/;
+
 export interface ColumnEditorProps {
+  sheetId: string;
   /** The column being edited, or null for a new one. */
   column: ColumnView | null;
-  /** Names of the sheet's other columns, offered for formulas. */
-  otherNames: string[];
+  /** The sheet's other columns, offered for formulas. */
+  others: ColumnView[];
   at: { x: number; y: number };
   onSave: (spec: ColumnSpec) => void;
   onInsert?: (side: "left" | "right") => void;
@@ -24,46 +49,71 @@ export interface ColumnEditorProps {
   onClose: () => void;
 }
 
-const ref = (name: string) => (/^[\p{L}_][\p{L}\p{N}_]*$/u.test(name) ? name : `[${name}]`);
-
-export function ColumnEditor({ column, otherNames, at, onSave, onInsert, onDelete, onClose }: ColumnEditorProps) {
+export function ColumnEditor({ sheetId, column, others, at, onSave, onInsert, onDelete, onClose }: ColumnEditorProps) {
   const [name, setName] = useState(column?.name ?? "");
+  // The variable name follows the display name until it is edited by hand.
+  const [varName, setVarName] = useState(column?.var ?? "");
+  const [varTouched, setVarTouched] = useState(!!column);
   const [kind, setKind] = useState<Kind>(column?.type ?? "text");
   const [currency, setCurrency] = useState(column?.type === "money" ? column.currency : "USD");
-  const [formula, setFormula] = useState(column?.type === "calc" ? column.formula : "");
+  const [formula, setFormula] = useState(column?.formula_display ?? (column?.type === "calc" ? column.formula : ""));
   const [total, setTotal] = useState(column?.total ?? false);
-  const [formulaError, setFormulaError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<{ ok: boolean; lines: string[] } | null>(null);
+  const formulaRef = useRef<HTMLInputElement>(null);
 
-  // Check the formula as it is typed.
+  useEffect(() => {
+    if (!varTouched) setVarName(varFromName(name));
+  }, [name, varTouched]);
+
+  // Try the formula as it is typed.
   useEffect(() => {
     if (kind !== "calc" || !formula.trim()) {
-      setFormulaError(null);
+      setPreview(null);
       return;
     }
     let live = true;
     const t = setTimeout(() => {
-      api.checkFormula(formula).then((e) => live && setFormulaError(e));
-    }, 150);
+      api
+        .previewFormula(sheetId, column?.col_id ?? null, formula)
+        .then((lines) => live && setPreview({ ok: true, lines }))
+        .catch((e) => live && setPreview({ ok: false, lines: [String(e).replace(/^invalid value: /, "")] }));
+    }, 200);
     return () => {
       live = false;
       clearTimeout(t);
     };
-  }, [kind, formula]);
+  }, [kind, formula, sheetId, column?.col_id]);
 
-  // Close on Escape.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  const insert = (text: string) => {
+    const el = formulaRef.current;
+    if (!el) return setFormula((f) => f + text);
+    const start = el.selectionStart ?? formula.length;
+    const end = el.selectionEnd ?? formula.length;
+    const next = formula.slice(0, start) + text + formula.slice(end);
+    setFormula(next);
+    requestAnimationFrame(() => {
+      el.focus();
+      el.setSelectionRange(start + text.length, start + text.length);
+    });
+  };
+
   const currencyOk = /^[A-Za-z]{3}$/.test(currency.trim());
+  const varOk = VAR_OK.test(varName) && !/^[cr]\d+$/.test(varName);
   const canSave =
-    name.trim() !== "" && (kind !== "money" || currencyOk) && (kind !== "calc" || (formula.trim() !== "" && !formulaError));
+    name.trim() !== "" &&
+    varOk &&
+    (kind !== "money" || currencyOk) &&
+    (kind !== "calc" || (formula.trim() !== "" && preview?.ok !== false));
 
   const save = () => {
     if (!canSave) return;
-    const base = { name: name.trim(), total };
+    const base = { name: name.trim(), var: varName, total };
     const spec: ColumnSpec =
       kind === "money"
         ? { ...base, type: "money", currency: currency.trim().toUpperCase() }
@@ -73,25 +123,44 @@ export function ColumnEditor({ column, otherNames, at, onSave, onInsert, onDelet
     onSave(spec);
   };
 
-  const left = Math.min(at.x, window.innerWidth - 380);
-  const top = Math.min(at.y, window.innerHeight - 420);
+  const left = Math.max(8, Math.min(at.x, window.innerWidth - 420));
+  const top = Math.max(8, Math.min(at.y, window.innerHeight - 520));
 
   return (
     <>
       <div className="backdrop" onClick={onClose} />
       <form
         className="column-editor"
-        style={{ left: Math.max(8, left), top: Math.max(8, top) }}
+        style={{ left, top }}
         onSubmit={(e) => {
           e.preventDefault();
           save();
         }}
       >
-        <div className="ce-title">{column ? `Column ${column.letter}` : "New column"}</div>
-        <label>
-          Name
-          <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. UAH, Qty, Total USD" />
-        </label>
+        <div className="ce-head">
+          <span className="ce-id">{column ? column.col_id : "new"}</span>
+          <span className="ce-title">{column ? "Edit column" : "New column"}</span>
+        </div>
+
+        <div className="ce-names-row">
+          <label>
+            Display name
+            <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Price (UAH)" />
+          </label>
+          <label>
+            Variable name
+            <input
+              value={varName}
+              onChange={(e) => {
+                setVarTouched(true);
+                setVarName(e.target.value);
+              }}
+              placeholder="price_uah"
+              className={varOk ? "mono" : "mono bad"}
+              spellCheck={false}
+            />
+          </label>
+        </div>
 
         <div className="kinds">
           {KINDS.map((k) => (
@@ -101,54 +170,60 @@ export function ColumnEditor({ column, otherNames, at, onSave, onInsert, onDelet
               className={k.kind === kind ? "on" : ""}
               onClick={() => {
                 setKind(k.kind);
-                if (k.kind === "money" || k.kind === "calc") setTotal((t) => t || k.kind === "calc");
+                if (k.kind === "calc") setTotal(true);
               }}
-              title={k.hint}
             >
               {k.label}
             </button>
           ))}
-        </div>
-
-        {kind === "money" && (
-          <label>
-            Currency
+          {kind === "money" && (
             <input
               value={currency}
               onChange={(e) => setCurrency(e.target.value.toUpperCase())}
               maxLength={3}
-              className={currencyOk ? "" : "bad"}
+              size={4}
+              className={currencyOk ? "currency" : "currency bad"}
               placeholder="UAH"
+              title="Currency"
             />
-          </label>
-        )}
+          )}
+        </div>
 
         {kind === "calc" && (
           <>
-            <label>
-              Formula
-              <input
-                value={formula}
-                onChange={(e) => setFormula(e.target.value)}
-                placeholder="e.g. [Unit USD] * Qty"
-                className={formulaError ? "bad" : ""}
-                spellCheck={false}
-              />
-            </label>
-            {formulaError && <div className="ce-error">{formulaError}</div>}
-            {otherNames.length > 0 && (
-              <div className="ce-names">
-                {otherNames.map((n) => (
-                  <button type="button" key={n} onClick={() => setFormula((f) => (f ? `${f} ${ref(n)}` : ref(n)))}>
-                    {n}
-                  </button>
-                ))}
+            <input
+              ref={formulaRef}
+              value={formula}
+              onChange={(e) => setFormula(e.target.value)}
+              placeholder="unit_usd * qty"
+              className={preview?.ok === false ? "mono formula bad" : "mono formula"}
+              spellCheck={false}
+            />
+            {preview && (
+              <div className={preview.ok ? "ce-preview" : "ce-error"}>
+                {preview.ok ? (preview.lines.length ? preview.lines.join(" · ") : "No rows with values yet") : preview.lines[0]}
               </div>
             )}
-            <div className="ce-help">
-              <code>to(UAH, USD)</code> converts at the sheet's rates · <code>coalesce(a, b)</code> first filled in ·{" "}
-              <code>round(x)</code> · <code>+ − × ÷</code>
+            <div className="ce-section">Columns you can use</div>
+            <div className="ce-cols">
+              {others.map((c) => (
+                <button type="button" key={c.col_id} onClick={() => insert(c.var)} title={`Insert ${c.var}`}>
+                  <span className="ce-id">{c.col_id}</span> <span className="mono">{c.var}</span>{" "}
+                  <span className="muted">{c.name}</span>
+                </button>
+              ))}
             </div>
+            <div className="ce-section">Examples</div>
+            <table className="ce-examples">
+              <tbody>
+                {examples(others).map(([f, what]) => (
+                  <tr key={f}>
+                    <td className="mono">{f}</td>
+                    <td>{what}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </>
         )}
 

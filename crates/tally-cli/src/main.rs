@@ -204,7 +204,7 @@ fn show(project: &str, sheet: Option<&str>) -> Res {
     println!("{}  (rates as of {})\n", v.name, v.as_of);
     let width = |j: usize| if j == 0 { 30 } else { 14 };
     let fit = |s: &str, w: usize| s.chars().take(w).collect::<String>();
-    let head: Vec<String> = v.columns.iter().enumerate().map(|(j, c)| format!("{:<w$}", fit(&format!("{} {}", c.letter, c.name), width(j)), w = width(j))).collect();
+    let head: Vec<String> = v.columns.iter().enumerate().map(|(j, c)| format!("{:<w$}", fit(&format!("{} {}", c.col_id, c.name), width(j)), w = width(j))).collect();
     println!("{}", head.join(" "));
     for r in &v.rows {
         let cells: Vec<String> = r

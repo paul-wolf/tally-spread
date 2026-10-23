@@ -199,3 +199,21 @@ button.danger { color: var(--error); }
 .add-menu small { color: var(--muted); font-size: 11px; }
 .fixed-row { display: inline-flex; align-items: center; gap: 4px; }
 .totals .hint { color: var(--muted); font-size: 12px; }
+
+/* column editor, v2 */
+.column-editor { width: 410px; }
+.ce-head { display: flex; align-items: baseline; gap: 8px; }
+.ce-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--muted); background: var(--bg); border-radius: 4px; padding: 1px 5px; }
+.ce-names-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.mono, .column-editor input.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+.muted { color: var(--muted); }
+.kinds input.currency { width: 56px; text-transform: uppercase; }
+.column-editor input.formula { width: 100%; }
+.ce-preview { color: var(--muted); font-size: 12px; }
+.ce-section { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin-top: 2px; }
+.ce-cols { display: flex; flex-direction: column; gap: 2px; max-height: 150px; overflow-y: auto; }
+.ce-cols button { text-align: left; border: none; padding: 3px 6px; font-size: 12.5px; }
+.ce-cols button:hover { background: var(--bg); }
+.ce-examples { border-collapse: collapse; font-size: 12px; }
+.ce-examples td { padding: 2px 10px 2px 0; color: var(--muted); }
+.ce-examples td.mono { color: var(--text); white-space: nowrap; }

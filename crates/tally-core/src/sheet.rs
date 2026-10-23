@@ -43,11 +43,15 @@ pub struct SheetView {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ColumnView {
+    /// Invariant ID: c1, c2, …
     pub col_id: String,
-    /// Spreadsheet-style letter: A, B, … Z, AA.
-    pub letter: String,
     pub position: f64,
+    /// Display name, e.g. "Price (UAH)".
     pub name: String,
+    /// Variable name for formulas and SQL, e.g. price_uah.
+    pub var: String,
+    /// For calculated columns: the formula written with variable names.
+    pub formula_display: Option<String>,
     #[serde(flatten)]
     pub kind: ColumnKind,
     pub total: bool,
@@ -81,7 +85,7 @@ pub struct TotalView {
     pub complete: bool,
 }
 
-/// Spreadsheet column letter for a 0-based index.
+/// Excel column letter for a 0-based index (used when exporting to XLSX).
 pub fn col_letter(index: usize) -> String {
     let mut n = index + 1;
     let mut s = String::new();
@@ -152,16 +156,11 @@ struct RowCtx<'a> {
 }
 
 impl Context for RowCtx<'_> {
-    fn column(&self, name: &str) -> Option<Value> {
-        let col = self
-            .columns
-            .iter()
-            .find(|c| c.spec.name.eq_ignore_ascii_case(name))
-            .or_else(|| {
-                // A column letter, if no column has that name.
-                self.columns.iter().enumerate().find(|(i, _)| col_letter(*i) == name).map(|(_, c)| c)
-            })?;
-        Some(self.values.get(&col.col_id).cloned().unwrap_or(Value::Empty))
+    fn column(&self, id: &str) -> Option<Value> {
+        if !self.columns.iter().any(|c| c.col_id == id) {
+            return None;
+        }
+        Some(self.values.get(id).cloned().unwrap_or(Value::Empty))
     }
 
     fn convert(&self, amount: Decimal, from: &Currency, to: &Currency) -> std::result::Result<Decimal, String> {
@@ -170,20 +169,14 @@ impl Context for RowCtx<'_> {
 }
 
 /// Calculated columns in an order where each comes after the ones it uses.
-fn calc_order(columns: &[ColumnInfo]) -> (Vec<(usize, Expr)>, HashMap<usize, String>) {
+fn calc_order(columns: &[ColumnInfo], cols: &[formula::ColRef]) -> (Vec<(usize, Expr)>, HashMap<usize, String>) {
     let mut parsed: Vec<(usize, Expr, Vec<usize>)> = Vec::new();
     let mut errors = HashMap::new();
-    let find = |name: &str| {
-        columns
-            .iter()
-            .position(|c| c.spec.name.eq_ignore_ascii_case(name))
-            .or_else(|| (0..columns.len()).find(|i| col_letter(*i) == name))
-    };
     for (i, c) in columns.iter().enumerate() {
         if let ColumnKind::Calc { formula: src } = &c.spec.kind {
-            match formula::parse(src) {
+            match formula::parse(src).and_then(|e| formula::resolve(&e, cols)) {
                 Ok(e) => {
-                    let deps = formula::names(&e).iter().filter_map(|n| find(n)).collect();
+                    let deps = formula::refs(&e).iter().filter_map(|id| columns.iter().position(|c| &c.col_id == id)).collect();
                     parsed.push((i, e, deps));
                 }
                 Err(e) => {
@@ -267,9 +260,71 @@ impl Sum {
 
 impl Project {
     pub fn sheet_view(&self, sheet_id: &str, rates: &RateTable, today: NaiveDate) -> Result<SheetView> {
+        self.sheet_view_with(sheet_id, rates, today, None)
+    }
+
+    /// Try a formula before saving it: its result on the first rows that give one.
+    /// `col_id` is the column being edited (or `None` for a new column).
+    pub fn preview_formula(
+        &self,
+        sheet_id: &str,
+        col_id: Option<&str>,
+        source: &str,
+        rates: &RateTable,
+        today: NaiveDate,
+    ) -> Result<Vec<String>> {
+        let id = col_id.unwrap_or("__preview").to_string();
+        let expr = formula::parse(source).map_err(crate::Error::InvalidValue)?;
+        let mut cols = self.col_refs(sheet_id)?;
+        if col_id.is_none() {
+            cols.push(formula::ColRef { id: id.clone(), var: "__preview".into(), display: "__preview".into() });
+        }
+        let resolved = formula::resolve(&expr, &cols).map_err(crate::Error::InvalidValue)?;
+        if formula::refs(&resolved).contains(&id) {
+            return Err(crate::Error::InvalidValue("the formula refers to its own column".into()));
+        }
+        let extra = ColumnInfo {
+            col_id: id.clone(),
+            position: f64::MAX,
+            spec: crate::ops::ColumnSpec {
+                name: "__preview".into(),
+                var: "__preview".into(),
+                kind: ColumnKind::Calc { formula: resolved.to_string() },
+                total: false,
+            },
+        };
+        let view = self.sheet_view_with(sheet_id, rates, today, Some(extra))?;
+        let j = view.columns.iter().position(|c| c.col_id == id).expect("preview column");
+        let mut out = Vec::new();
+        for (n, r) in view.rows.iter().enumerate() {
+            if r.kind != RowKind::Item {
+                continue;
+            }
+            let c = &r.cells[j];
+            let text = match (&c.value, &c.currency, &c.error) {
+                (_, _, Some(e)) => format!("row {}: {e}", n + 1),
+                (Some(v), Some(cur), _) => format!("row {}: {v} {cur}", n + 1),
+                (Some(v), None, _) => format!("row {}: {v}", n + 1),
+                _ => continue,
+            };
+            out.push(text);
+            if out.len() == 3 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn sheet_view_with(&self, sheet_id: &str, rates: &RateTable, today: NaiveDate, extra: Option<ColumnInfo>) -> Result<SheetView> {
         let sheet = self.sheet(sheet_id)?;
         let settings = self.settings();
-        let columns = self.columns(sheet_id)?;
+        let mut columns = self.columns(sheet_id)?;
+        if let Some(x) = extra {
+            match columns.iter_mut().find(|c| c.col_id == x.col_id) {
+                Some(c) => c.spec.kind = x.spec.kind,
+                None => columns.push(x),
+            }
+        }
         let rows = self.rows(sheet_id)?;
         let stored = self.cells(sheet_id)?;
         let as_of = sheet.rates.as_of(today);
@@ -293,7 +348,11 @@ impl Project {
             .collect();
         let conv = Converter { rates, fixed, as_of, sources: effective_sources.clone(), used: RefCell::new(vec![]) };
 
-        let (order, column_errors) = calc_order(&columns);
+        let col_refs: Vec<formula::ColRef> = columns
+            .iter()
+            .map(|c| formula::ColRef { id: c.col_id.clone(), var: c.spec.var.clone(), display: c.spec.name.clone() })
+            .collect();
+        let (order, column_errors) = calc_order(&columns, &col_refs);
         let per_line = settings.rounding_scope == RoundingScope::PerLine;
         let mut warnings: Vec<String> = Vec::new();
         let mut warn = |w: String| {
@@ -415,9 +474,18 @@ impl Project {
                 .enumerate()
                 .map(|(i, c)| ColumnView {
                     col_id: c.col_id.clone(),
-                    letter: col_letter(i),
                     position: c.position,
                     name: c.spec.name.clone(),
+                    var: c.spec.var.clone(),
+                    formula_display: match &c.spec.kind {
+                        ColumnKind::Calc { formula: src } => Some(
+                            formula::parse(src)
+                                .and_then(|e| formula::resolve(&e, &col_refs))
+                                .map(|e| formula::render(&e, &col_refs))
+                                .unwrap_or_else(|_| src.clone()),
+                        ),
+                        _ => None,
+                    },
                     kind: c.spec.kind.clone(),
                     total: c.spec.total,
                     error: column_errors.get(&i).cloned(),
@@ -450,7 +518,7 @@ impl Project {
             let mut used = vec!["row".to_string(), "section".to_string()];
             let mut col_names = Vec::new();
             for c in &view.columns {
-                let mut name = ident(&c.name);
+                let mut name = c.var.clone();
                 while used.contains(&name) {
                     name.push('_');
                 }
@@ -550,7 +618,8 @@ mod tests {
 
         let v = p.sheet_view("s", &rates(), d("2026-10-22")).unwrap();
         assert!(v.warnings.is_empty(), "{:?}", v.warnings);
-        assert_eq!(v.columns.iter().map(|c| c.letter.as_str()).collect::<Vec<_>>(), ["A", "B", "C", "D", "E", "F"]);
+        assert_eq!(v.columns.iter().map(|c| c.var.as_str()).collect::<Vec<_>>(), ["item", "uah", "usd", "unit_usd", "qty", "total_usd"]);
+        assert_eq!(v.columns[5].formula_display.as_deref(), Some("unit_usd * qty"));
         // 3250 UAH / 44 = 73.86 USD each, × 2 = 147.72.
         assert_eq!(cell(&v, 1, "unit").value.as_deref(), Some("73.86"));
         assert_eq!(cell(&v, 1, "total").value.as_deref(), Some("147.72"));
@@ -579,8 +648,9 @@ mod tests {
             position: 10.0,
             spec: crate::ops::ColumnSpec {
                 name: "EUR".into(),
-                kind: ColumnKind::Calc { formula: "to([Total USD], EUR)".into() },
+                kind: ColumnKind::Calc { formula: "to(total_usd, EUR)".into() },
                 total: false,
+                var: String::new(),
             },
         })
         .unwrap();
@@ -636,6 +706,23 @@ mod tests {
             .unwrap();
         assert_eq!(section, "Frame");
         assert_eq!(Decimal::from_str(&total).unwrap(), dec!(200));
+    }
+
+    #[test]
+    fn formula_preview() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = spending_project(tmp.path());
+        add_row(&mut p, "a", &[("uah", "4400"), ("qty", "3")]);
+        let got = p.preview_formula("s", None, "total_usd * 2", &rates(), d("2026-10-22")).unwrap();
+        assert_eq!(got, ["row 1: 600.00 USD"]);
+        assert!(p.preview_formula("s", None, "nope * 2", &rates(), d("2026-10-22")).is_err());
+        assert!(p.preview_formula("s", Some("total"), "total_usd * 2", &rates(), d("2026-10-22")).is_err(), "itself");
+        // The spending template works out of the box.
+        let id = "t".to_string();
+        p.apply(Op::Batch { ops: crate::templates::sheet_ops("spending", &id, "Kit") }).unwrap();
+        let cols = p.columns("t").unwrap();
+        assert_eq!(cols.iter().map(|c| c.col_id.as_str()).collect::<Vec<_>>(), ["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"]);
+        assert_eq!(cols[5].spec.kind, ColumnKind::Calc { formula: "coalesce(to(c4, USD), c5)".into() });
     }
 
     #[test]

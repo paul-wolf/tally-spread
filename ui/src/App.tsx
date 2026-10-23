@@ -374,8 +374,9 @@ export default function App() {
       {editing && view && (
         <ColumnEditor
           key={editing.mode === "edit" ? editedColumn?.col_id : `new-${editing.position}`}
+          sheetId={view.sheet_id}
           column={editedColumn}
-          otherNames={view.columns.filter((c) => c !== editedColumn).map((c) => c.name)}
+          others={view.columns.filter((c) => c !== editedColumn)}
           at={editing.at}
           onClose={() => setEditing(null)}
           onSave={async (spec: ColumnSpec) => {
@@ -385,7 +386,7 @@ export default function App() {
                 : {
                     op: "add_column",
                     sheet_id: view.sheet_id,
-                    col_id: newId(),
+                    col_id: "", // the engine assigns the next ID (c1, c2, …)
                     position: editing.mode === "new" ? editing.position : 0,
                     spec,
                   };

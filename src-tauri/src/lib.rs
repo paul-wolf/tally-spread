@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 use chrono::{Local, NaiveDate};
 use serde::Serialize;
+use tally_core::analysis;
 use tally_core::fx::sources::{self, fetch};
 use tally_core::fx::{RateRecord, RateSource, RateTable};
 use tally_core::home::{machine_id, tally_home};
@@ -346,6 +347,59 @@ fn create_sheet(state: State<AppState>, name: String, template: String) -> CmdRe
     inner.snapshot(Some(&id), vec![])
 }
 
+fn current_view(state: &State<AppState>, sheet_id: &str) -> CmdResult<tally_core::sheet::SheetView> {
+    let inner = state.0.lock().map_err(err)?;
+    inner.project.sheet_view(sheet_id, &inner.rates, today()).map_err(err)
+}
+
+/// Columns over time (bucketed to about `max_points`).
+#[tauri::command]
+fn analyze_series(state: State<AppState>, sheet_id: String, x: Option<String>, cols: Vec<String>, max_points: usize) -> CmdResult<analysis::Series> {
+    let view = current_view(&state, &sheet_id)?;
+    analysis::series(&view, x.as_deref(), &cols, max_points.max(10)).map_err(err)
+}
+
+/// A column's distribution: quartiles, histogram, normal fit (or category counts).
+#[tauri::command]
+fn analyze_distribution(state: State<AppState>, sheet_id: String, col: String) -> CmdResult<analysis::Distribution> {
+    let view = current_view(&state, &sheet_id)?;
+    analysis::distribution(&view, &col).map_err(err)
+}
+
+/// Rows grouped by a column (or time buckets), with aggregates of `cols`.
+#[tauri::command]
+fn analyze_groups(state: State<AppState>, sheet_id: String, by: String, cols: Vec<String>, bucket: Option<f64>) -> CmdResult<analysis::Groups> {
+    let view = current_view(&state, &sheet_id)?;
+    analysis::groups(&view, &by, &cols, bucket).map_err(err)
+}
+
+/// Keep a group summary as a new sheet.
+#[tauri::command]
+fn save_groups_sheet(
+    state: State<AppState>,
+    sheet_id: String,
+    by: String,
+    cols: Vec<String>,
+    bucket: Option<f64>,
+    name: String,
+) -> CmdResult<Snapshot> {
+    let view = current_view(&state, &sheet_id)?;
+    let g = analysis::groups(&view, &by, &cols, bucket).map_err(err)?;
+    let table = analysis::groups_table(&g, |secs| {
+        chrono::DateTime::from_timestamp_micros((secs * 1e6) as i64).map_or(secs.to_string(), |t| tally_core::time::show_moment(&t))
+    });
+    let mut inner = state.0.lock().map_err(err)?;
+    let id = Op::new_id();
+    inner.project.apply(Op::Batch { ops: tally_core::import::sheet_ops(&table, &id, &name) }).map_err(err)?;
+    inner.snapshot(Some(&id), vec![])
+}
+
+/// Write bytes (a chart image) to a file the user chose.
+#[tauri::command]
+fn write_file(path: String, bytes: Vec<u8>) -> CmdResult<()> {
+    std::fs::write(path, bytes).map_err(err)
+}
+
 /// Add a CSV or JSON file as a new sheet; its columns are typed from the values.
 #[tauri::command]
 fn import_file(state: State<AppState>, path: String) -> CmdResult<Snapshot> {
@@ -461,7 +515,12 @@ pub fn run() {
             try_function,
             export_xlsx,
             export_sheet,
-            import_file
+            import_file,
+            analyze_series,
+            analyze_distribution,
+            analyze_groups,
+            save_groups_sheet,
+            write_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tally");

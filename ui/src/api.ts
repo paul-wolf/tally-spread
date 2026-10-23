@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Op, ProjectSettings, RateSource, RefreshReport, Snapshot, UserFunction } from "./types";
+import type { Distribution, Groups, Op, ProjectSettings, RateSource, RefreshReport, Series, Snapshot, UserFunction } from "./types";
 
 export type ExportFormat = "xlsx" | "pdf" | "csv" | "json";
 
@@ -24,6 +24,14 @@ export const api = {
   deleteFunction: (name: string, sheetId: string | null) => invoke<Snapshot>("delete_function", { name, sheetId }),
   tryFunction: (fn: UserFunction, expression: string) => invoke<string>("try_function", { function: fn, expression }),
   exportXlsx: (sheetId: string, path: string) => invoke<void>("export_xlsx", { sheetId, path }),
+  analyzeSeries: (sheetId: string, x: string | null, cols: string[], maxPoints: number) =>
+    invoke<Series>("analyze_series", { sheetId, x, cols, maxPoints }),
+  analyzeDistribution: (sheetId: string, col: string) => invoke<Distribution>("analyze_distribution", { sheetId, col }),
+  analyzeGroups: (sheetId: string, by: string, cols: string[], bucket: number | null) =>
+    invoke<Groups>("analyze_groups", { sheetId, by, cols, bucket }),
+  saveGroupsSheet: (sheetId: string, by: string, cols: string[], bucket: number | null, name: string) =>
+    invoke<Snapshot>("save_groups_sheet", { sheetId, by, cols, bucket, name }),
+  writeFile: (path: string, bytes: number[]) => invoke<void>("write_file", { path, bytes }),
   importFile: (path: string) => invoke<Snapshot>("import_file", { path }),
   exportSheet: (sheetId: string, path: string, format: ExportFormat) => invoke<void>("export_sheet", { sheetId, path, format }),
 };

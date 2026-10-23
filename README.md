@@ -25,6 +25,7 @@ Status: early but usable. Sheets with your own columns, calculated columns, sect
 - **Exact money**: decimal arithmetic, per-currency rounding; amounts typed as `₴12 499,50`, `$ 71.50`, `1,234.56` or `12.50 EUR`.
 - **Typing and pasting like a spreadsheet.** Blank rows are always there to type into. Paste from Excel or Google Sheets anywhere (a heading row is skipped; values that don't fit a column are left out and reported). Copy, cut, transposed copy and paste, fill down, undo/redo of everything.
 - **Sheets as tabs** (blank, a spending-list template, or **from a file**: a CSV or JSON file becomes a sheet whose columns are named after its headings and typed from its values: numbers, dates, dates and times, Unix timestamps when the heading says so (`ts`, `time`, `created_at`), money in one currency, links, text); **projects** as folders.
+- **Analyse** (toolbar or ⇧⌘A, on the selected columns): a drawer beside the grid with charts of values **over time** (against the sheet's date & time column; long logs are grouped into time buckets with the average as a line and lowest–highest as a band), **distributions** (histogram with a fitted normal curve, box plot, quartiles, outliers, skewness; counts for text columns) and **groups** (by a column, or by time every minute, hour, …: rows, mean, min, median, max). Charts save as PNG, figures copy as text, a group summary can be kept as a sheet. Nothing is added to the sheet itself.
 - **Export** to XLSX (real `=SUM()` subtotals and totals, clickable links, the rates used), PDF (laid out like the sheet, with section subtotals, totals and rates), and CSV or JSON for other tools (one line per item, its section as a field).
 - **Bold columns**: tick Bold in the column dialog; it carries into XLSX and PDF.
 - **Two machines**: logs are per machine, so a synced folder (Syncthing) never has two writers per file; the app picks up the other machine's changes every few seconds.
@@ -92,6 +93,7 @@ Projects made by the first skeleton version can't be opened; they are skipped.
 | ⌘C / ⌘X / ⌘V | Copy / cut / paste (tab-separated, works with Excel and Google Sheets) |
 | ⇧⌘C / ⇧⌘V | Copy / paste transposed |
 | ⌘D | Fill down |
+| ⇧⌘A | Analyse the selected columns |
 | ⌘Z / ⇧⌘Z | Undo / redo |
 | ⌘Enter | Insert a row above the selection |
 | ⇧⌘S | Make the selected row a section heading (or back) |

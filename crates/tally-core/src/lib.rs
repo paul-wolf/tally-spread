@@ -5,6 +5,7 @@
 //! it can be queried with SQL. The UI and the AI both work by producing [`ops::Op`]s;
 //! the engine applies them and does all the math.
 
+pub mod analysis;
 pub mod error;
 pub mod export;
 pub mod formats;

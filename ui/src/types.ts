@@ -181,3 +181,71 @@ export const SOURCE_LABEL: Record<RateSource, string> = {
   hmrc_monthly: "HMRC",
   manual: "Manual",
 };
+
+// ------------------------------------------------------------------ analysis
+
+export interface SeriesLine {
+  col_id: string;
+  name: string;
+  currency: string | null;
+  avg: (number | null)[];
+  min: (number | null)[] | null;
+  max: (number | null)[] | null;
+}
+
+export interface Series {
+  x: number[];
+  x_is_time: boolean;
+  x_name: string;
+  bucket: number | null;
+  points: number;
+  lines: SeriesLine[];
+}
+
+export interface Stats {
+  count: number;
+  empty: number;
+  mean: number;
+  sd: number;
+  min: number;
+  q1: number;
+  median: number;
+  q3: number;
+  max: number;
+  sum: number;
+  skewness: number;
+  kurtosis: number;
+  outliers: number;
+  low_fence: number;
+  high_fence: number;
+}
+
+export interface Distribution {
+  col_id: string;
+  name: string;
+  currency: string | null;
+  is_time: boolean;
+  stats: Stats | null;
+  edges: number[];
+  counts: number[];
+  normal: number[];
+  shape: string;
+  categories: [string, number][];
+}
+
+export interface Aggregate {
+  count: number;
+  mean: number | null;
+  min: number | null;
+  median: number | null;
+  max: number | null;
+  sum: number | null;
+}
+
+export interface Groups {
+  by: string;
+  by_time: boolean;
+  bucket: number | null;
+  columns: string[];
+  groups: { key: string; start: number | null; rows: number; values: Aggregate[] }[];
+}

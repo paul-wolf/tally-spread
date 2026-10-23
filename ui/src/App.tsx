@@ -4,6 +4,7 @@ import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { api, newId, type ExportFormat } from "./api";
 import { ColumnEditor } from "./ColumnEditor";
+import { AnalysisPanel } from "./AnalysisPanel";
 import { FunctionsPanel } from "./FunctionsPanel";
 import { RateCardPanel } from "./RateCardPanel";
 import { money, parseTsv, shortDate, toTsv, transpose } from "./format";
@@ -43,6 +44,8 @@ export default function App() {
   const [rateBusy, setRateBusy] = useState(false);
   const [editing, setEditing] = useState<Editing | null>(null);
   const [panel, setPanel] = useState<"rates" | "functions" | null>(null);
+  // The analysis drawer and the columns it opened with.
+  const [analyse, setAnalyse] = useState<string[] | null>(null);
   const dark = usePrefersDark();
 
   const sheetRef = useRef<string | null>(null);
@@ -225,6 +228,20 @@ export default function App() {
     void apply(ops.length === 1 ? ops[0] : { op: "batch", ops });
   }, [apply, selectedRows]);
 
+  /** Column IDs the selection touches: whole columns, a range, or the current cell. */
+  const selectedColumns = useCallback((): string[] => {
+    const v = snapRef.current?.sheet;
+    if (!v) return [];
+    const sel = selectionRef.current;
+    let idx = sel.columns.toArray();
+    if (!idx.length && sel.current) {
+      const r = sel.current.range;
+      idx = Array.from({ length: r.width }, (_, i) => r.x + i);
+    }
+    return idx.map((i) => v.columns[i]?.col_id).filter((x): x is string => !!x);
+  }, []);
+  const openAnalysis = useCallback(() => setAnalyse(selectedColumns()), [selectedColumns]);
+
   // Keyboard shortcuts that sit above the grid.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -252,6 +269,9 @@ export default function App() {
       } else if (e.shiftKey && k === "s") {
         e.preventDefault();
         toggleSection();
+      } else if (e.shiftKey && k === "a") {
+        e.preventDefault();
+        openAnalysis();
       } else if (e.key === "PageDown" || e.key === "PageUp") {
         const sheets = snapRef.current?.sheets ?? [];
         const i = sheets.findIndex((s) => s.sheet_id === sheetRef.current);
@@ -266,7 +286,7 @@ export default function App() {
     // Capture phase, so the shortcuts work while the grid has focus.
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [run, paste, copy, insertRowAbove, toggleSection, editing, panel]);
+  }, [run, paste, copy, insertRowAbove, toggleSection, openAnalysis, editing, panel]);
 
   const openColumnEditor = useCallback((index: number | "new", at: Rectangle) => {
     const v = snapRef.current?.sheet;
@@ -330,6 +350,7 @@ export default function App() {
         onToggleSection={toggleSection}
         onOpenRateCard={() => setPanel("rates")}
         onOpenFunctions={() => setPanel("functions")}
+        onAnalyse={openAnalysis}
         onAddColumn={(at) => {
           const v = snapRef.current?.sheet;
           if (!v) return;
@@ -449,6 +470,21 @@ export default function App() {
         />
       )}
 
+      {analyse && view && (
+        <AnalysisPanel
+          key={view.sheet_id}
+          view={view}
+          initialCols={analyse}
+          onClose={() => setAnalyse(null)}
+          onSaved={(s) => {
+            show(s);
+            setAnalyse(null);
+            setMessage({ text: `Saved the summary as the sheet “${s.sheet?.name ?? ""}”.` });
+          }}
+          onError={fail}
+        />
+      )}
+
       {panel === "rates" && view && <RateCardPanel view={view} onApply={apply} onClose={() => setPanel(null)} />}
       {panel === "functions" && (
         <FunctionsPanel
@@ -493,6 +529,7 @@ function TopBar(props: {
   onAddColumn: (at: Rectangle) => void;
   onOpenRateCard: () => void;
   onOpenFunctions: () => void;
+  onAnalyse: () => void;
 }) {
   const { snap } = props;
   const view = snap.sheet;
@@ -559,6 +596,9 @@ function TopBar(props: {
           </button>
           <button onClick={props.onOpenFunctions} title="Your own functions, usable in every formula">
             ƒ Functions
+          </button>
+          <button onClick={props.onAnalyse} title="Charts and figures for the selected columns (⇧⌘A)">
+            Analyse
           </button>
         </div>
       )}

@@ -20,7 +20,8 @@
     "marked": "^4.3.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-responsive-carousel": "^3.2.23"
+    "react-responsive-carousel": "^3.2.23",
+    "uplot": "1.6.32"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.0",

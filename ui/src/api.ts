@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Op, ProjectSettings, RateSource, RefreshReport, Snapshot, UserFunction } from "./types";
 
+export type ExportFormat = "xlsx" | "pdf" | "csv" | "json";
+
 // Thin typed wrappers over the Tauri commands in src-tauri/src/lib.rs.
 export const api = {
   snapshot: (sheetId: string | null) => invoke<Snapshot>("snapshot", { sheetId }),
@@ -22,6 +24,7 @@ export const api = {
   deleteFunction: (name: string, sheetId: string | null) => invoke<Snapshot>("delete_function", { name, sheetId }),
   tryFunction: (fn: UserFunction, expression: string) => invoke<string>("try_function", { function: fn, expression }),
   exportXlsx: (sheetId: string, path: string) => invoke<void>("export_xlsx", { sheetId, path }),
+  exportSheet: (sheetId: string, path: string, format: ExportFormat) => invoke<void>("export_sheet", { sheetId, path, format }),
 };
 
 export const newId = (): string => crypto.randomUUID().replace(/-/g, "");

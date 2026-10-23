@@ -403,6 +403,23 @@ fn export_xlsx(state: State<AppState>, sheet_id: String, path: String) -> CmdRes
     tally_core::export::export_xlsx(&view, Path::new(&path)).map_err(err)
 }
 
+/// Export a sheet as xlsx, pdf, csv or json (chosen by `format`).
+#[tauri::command]
+fn export_sheet(state: State<AppState>, sheet_id: String, path: String, format: String) -> CmdResult<()> {
+    let inner = state.0.lock().map_err(err)?;
+    let view = inner.project.sheet_view(&sheet_id, &inner.rates, today()).map_err(err)?;
+    let project = inner.project.settings().name.clone();
+    drop(inner);
+    let p = Path::new(&path);
+    match format.as_str() {
+        "xlsx" => tally_core::export::export_xlsx(&view, p).map_err(err),
+        "csv" => std::fs::write(p, tally_core::formats::to_csv(&view).map_err(err)?).map_err(err),
+        "json" => std::fs::write(p, serde_json::to_string_pretty(&tally_core::formats::to_json(&view, &project)).map_err(err)?).map_err(err),
+        "pdf" => std::fs::write(p, tally_core::formats::to_pdf(&view, &project).map_err(err)?).map_err(err),
+        other => Err(format!("unknown export format {other}")),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let inner = init().expect("could not open the Tally folder");
@@ -428,7 +445,8 @@ pub fn run() {
             save_function,
             delete_function,
             try_function,
-            export_xlsx
+            export_xlsx,
+            export_sheet
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tally");

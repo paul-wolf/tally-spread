@@ -13,7 +13,7 @@ fn col(sheet_id: &str, position: usize, name: &str, kind: ColumnKind, total: boo
         sheet_id: sheet_id.into(),
         col_id: String::new(), // next free ID: c1, c2, …
         position: position as f64,
-        spec: ColumnSpec { name: name.into(), var: String::new(), kind, total },
+        spec: ColumnSpec { name: name.into(), var: String::new(), kind, total, style: Default::default() },
     }
 }
 

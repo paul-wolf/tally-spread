@@ -286,3 +286,9 @@ button.suggest { padding: 2px 8px; font-size: 12px; }
 .ac-list button.on { background: var(--accent-soft, rgba(47,95,196,.14)); }
 .ac-list .ac-kind { margin-left: auto; font-size: 11px; }
 .warnings { max-height: 110px; overflow-y: auto; }
+
+.export-menu { position: relative; }
+.export-menu .menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 60; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.18); padding: 4px; display: flex; flex-direction: column; min-width: 180px; }
+.export-menu .menu button { text-align: left; border: none; background: none; padding: 6px 10px; border-radius: 5px; display: flex; justify-content: space-between; gap: 12px; }
+.export-menu .menu button:hover { background: var(--bg); }
+.backdrop.clear { background: transparent; }

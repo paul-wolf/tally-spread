@@ -12,7 +12,12 @@ export type ColumnKind =
   | { type: "calc"; formula: string; currency?: string | null };
 
 /** name = display name ("Price (UAH)"); var = variable name ("price_uah"; empty = derive). */
-export type ColumnSpec = { name: string; var: string; total: boolean } & ColumnKind;
+/** How a column looks (format, not type). */
+export interface ColumnStyle {
+  bold?: boolean;
+}
+
+export type ColumnSpec = { name: string; var: string; total: boolean; style?: ColumnStyle } & ColumnKind;
 
 export interface FixedRate {
   base: string;
@@ -49,6 +54,7 @@ export type ColumnView = {
   /** Calculated columns: the formula written with variable names. */
   formula_display: string | null;
   total: boolean;
+  style: ColumnStyle;
   error: string | null;
 } & ColumnKind;
 

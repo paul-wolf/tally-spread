@@ -88,7 +88,10 @@ pub fn export_xlsx(view: &SheetView, path: &Path) -> Result<()> {
         for (j, c) in view.columns.iter().enumerate() {
             let col = j as u16;
             let cell = &r.cells[j];
-            let fmt = Format::new().set_num_format(number_format(col_currency[j].as_ref()));
+            let mut fmt = Format::new().set_num_format(number_format(col_currency[j].as_ref()));
+            if c.style.bold {
+                fmt = fmt.set_bold();
+            }
             match (&c.kind, &cell.raw, &cell.value) {
                 (ColumnKind::Link, Some(url), _) if url.starts_with("http://") || url.starts_with("https://") => {
                     ws.write_url(row, col, Url::new(url.as_str()))?;
@@ -99,12 +102,12 @@ pub fn export_xlsx(view: &SheetView, path: &Path) -> Result<()> {
                             ws.write_number_with_format(row, col, n, &fmt)?;
                         }
                         None => {
-                            ws.write_string(row, col, v)?;
+                            ws.write_string_with_format(row, col, v, &fmt)?;
                         }
                     }
                 }
                 (_, Some(v), _) => {
-                    ws.write_string(row, col, v)?;
+                    ws.write_string_with_format(row, col, v, &fmt)?;
                 }
                 _ => {}
             }

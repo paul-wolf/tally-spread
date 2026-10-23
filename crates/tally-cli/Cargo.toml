@@ -11,6 +11,7 @@ name = "tally"
 path = "src/main.rs"
 
 [dependencies]
-tally-core = { path = "../tally-core", features = ["fetch"] }
+tally-core = { path = "../tally-core", features = ["fetch", "pdf"] }
+serde_json = "1.0.154"
 chrono = "0.4.45"
 duckdb = { version = "1.20000.0", features = ["bundled"] }

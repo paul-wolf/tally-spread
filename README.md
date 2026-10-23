@@ -8,7 +8,7 @@ Tally is not an Excel clone. It is a keyboard-first table tool built on DuckDB, 
 - **Design doc:** https://claude.ai/artifact/QQdXFgm7XTf5iW4VcSS8N9
 - **Repo:** https://github.com/paul-wolf/tally-spread (product name Tally; package name `tally-spread`)
 
-Status: early but usable. Sheets with your own columns, calculated columns, sections, rates and XLSX export work; AI, links-to-rows, taxes and PDF are next.
+Status: early but usable. Sheets with your own columns, calculated columns, sections, rates and export to XLSX, PDF, CSV and JSON work; AI, links-to-rows and taxes are next.
 
 ## What works now
 
@@ -18,14 +18,15 @@ Status: early but usable. Sheets with your own columns, calculated columns, sect
   - `unit_usd * qty`: line total
   - `to(c8, EUR)` or `[Total (USD)] * 1.2`: columns by ID or display name work too
 
-  Built-in functions: `to`, `coalesce`, `round`, `abs`, `min`, `max`, `if`, plus your own. Currency codes are predefined names in capitals (`USD`, `UAH`); variable names are lowercase, so they never clash. Formulas are stored by column ID, so renaming never breaks one. Amounts keep their currency: adding UAH to USD is an error, never a silent mix. The column dialog previews the result as you type. There are no per-cell formulas.
+  Built-in functions: `to`, `coalesce`, `round`, `abs`, `min`, `max`, `if`, plus your own. Currency codes are predefined names in capitals (`USD`, `UAH`); variable names are lowercase, so they never clash. Formulas are stored by column ID, so renaming never breaks one. Amounts keep their currency: adding UAH to USD is an error, never a silent mix. The column dialog completes names as you type and previews the result. Double-click any calculated value to see its column's formula. `coalesce()` flags rows where more than one of its values is filled in (say, a price typed in two currencies). There are no per-cell formulas.
 - **Sections and totals.** Any row can be a section heading. Columns marked "Show total" get a subtotal on each heading and a total in the Total row pinned at the bottom of the grid.
 - **Rate card per sheet.** Each currency gets exactly one rate against the sheet's base currency (e.g. USD), and every conversion goes through it, so a currency never has two rates in one sheet and cross rates always agree. Open it from the toolbar to see each rate's source, the date it applies to and when it was fetched. Rates float with the latest daily rates (ECB preferred; NBU covers hryvnia, which ECB does not publish; HMRC monthly available) or are pegged to a date; any rate can be pinned by hand.
 - **Your own functions.** Define `vat(x) = x * 0.2` or `usd(x) = to(x, USD)` once (ƒ Functions) and use them in any formula in every sheet and project; they live in the shared library and sync between machines. Functions can use their parameters, numbers, currencies, built-ins and each other (loops are refused).
 - **Exact money**: decimal arithmetic, per-currency rounding; amounts typed as `₴12 499,50`, `$ 71.50`, `1,234.56` or `12.50 EUR`.
 - **Typing and pasting like a spreadsheet.** Blank rows are always there to type into. Paste from Excel or Google Sheets anywhere (a heading row is skipped; values that don't fit a column are left out and reported). Copy, cut, transposed copy and paste, fill down, undo/redo of everything.
 - **Sheets as tabs** (blank, or a spending-list template); **projects** as folders.
-- **XLSX export** with real `=SUM()` subtotals and totals, clickable links and the rates used.
+- **Export** to XLSX (real `=SUM()` subtotals and totals, clickable links, the rates used), PDF (laid out like the sheet, with section subtotals, totals and rates), and CSV or JSON for other tools (one line per item, its section as a field).
+- **Bold columns**: tick Bold in the column dialog; it carries into XLSX and PDF.
 - **Two machines**: logs are per machine, so a synced folder (Syncthing) never has two writers per file; the app picks up the other machine's changes every few seconds.
 - **CLI** (`tally`) for the always-on hub: daily rate updates, conversions, printing a sheet, SQL over a project, export.
 
@@ -94,7 +95,8 @@ Projects made by the first skeleton version can't be opened; they are skipped.
 | ⌘Enter | Insert a row above the selection |
 | ⇧⌘S | Make the selected row a section heading (or back) |
 | Delete | Clear cells, or delete selected rows |
-| Click or right-click a column header | Edit the column: name, type, formula, insert, delete |
+| Double-click or right-click a column header | Edit the column: name, type, formula, style, insert, delete |
+| Double-click a calculated value | Edit its column's formula |
 | Ctrl+PageUp / PageDown | Previous / next sheet |
 | ⌘-click a link | Open it |
 

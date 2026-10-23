@@ -54,6 +54,22 @@ pub struct ColumnSpec {
     pub kind: ColumnKind,
     #[serde(default)]
     pub total: bool,
+    /// How the column looks (format, not type).
+    #[serde(default, skip_serializing_if = "Style::is_plain")]
+    pub style: Style,
+}
+
+/// How a column is shown, on screen and in exports.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Style {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bold: bool,
+}
+
+impl Style {
+    pub fn is_plain(&self) -> bool {
+        *self == Style::default()
+    }
 }
 
 /// Rows are items, or section headings that group the items below them.
@@ -195,6 +211,7 @@ mod tests {
                 var: "price_uah".into(),
                 kind: ColumnKind::Money { currency: Currency::new("UAH").unwrap() },
                 total: false,
+                style: Default::default(),
             },
         };
         let json = serde_json::to_string(&op).unwrap();

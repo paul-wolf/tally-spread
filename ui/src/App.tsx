@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { GridSelection, Rectangle } from "@glideapps/glide-data-grid";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { api, newId } from "./api";
+import { api, newId, type ExportFormat } from "./api";
 import { ColumnEditor } from "./ColumnEditor";
 import { FunctionsPanel } from "./FunctionsPanel";
 import { RateCardPanel } from "./RateCardPanel";
@@ -310,15 +310,15 @@ export default function App() {
             fail(e);
           }
         }}
-        onExport={async () => {
+        onExport={async (format: ExportFormat) => {
           if (!view) return;
           const path = await saveDialog({
-            defaultPath: `${view.name}.xlsx`,
-            filters: [{ name: "Excel workbook", extensions: ["xlsx"] }],
+            defaultPath: `${view.name}.${format}`,
+            filters: [{ name: EXPORT_LABEL[format], extensions: [format] }],
           });
           if (!path) return;
           try {
-            await api.exportXlsx(view.sheet_id, path);
+            await api.exportSheet(view.sheet_id, path, format);
             setMessage({ text: `Exported ${path.split(/[\\/]/).pop()}.` });
           } catch (e) {
             fail(e);
@@ -468,7 +468,7 @@ function TopBar(props: {
   onApply: (op: Op) => void;
   onRefreshRates: () => void;
   onImportRates: () => void;
-  onExport: () => void;
+  onExport: (format: ExportFormat) => void;
   onUndo: () => void;
   onRedo: () => void;
   onInsertRow: () => void;
@@ -565,12 +565,47 @@ function TopBar(props: {
         <button onClick={props.onRedo} disabled={!snap.can_redo} title="Redo (⇧⌘Z)">
           Redo
         </button>
-        <button className="primary" onClick={props.onExport} disabled={!view}>
-          Export XLSX
-        </button>
+        <ExportMenu disabled={!view} onExport={props.onExport} />
       </div>
 
     </header>
+  );
+}
+
+// ------------------------------------------------------------------ export
+
+const EXPORT_LABEL: Record<ExportFormat, string> = {
+  xlsx: "Excel workbook",
+  pdf: "PDF",
+  csv: "CSV",
+  json: "JSON",
+};
+
+/** Export the sheet: Excel, PDF for people, CSV and JSON for other tools. */
+function ExportMenu(props: { disabled: boolean; onExport: (f: ExportFormat) => void }) {
+  const [open, setOpen] = useState(false);
+  const pick = (f: ExportFormat) => {
+    setOpen(false);
+    props.onExport(f);
+  };
+  return (
+    <div className="export-menu">
+      <button className="primary" disabled={props.disabled} onClick={() => setOpen((o) => !o)}>
+        Export ▾
+      </button>
+      {open && (
+        <>
+          <div className="backdrop clear" onClick={() => setOpen(false)} />
+          <div className="menu">
+            {(["xlsx", "pdf", "csv", "json"] as ExportFormat[]).map((f) => (
+              <button key={f} onClick={() => pick(f)}>
+                {EXPORT_LABEL[f]} <span className="muted">.{f}</span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 

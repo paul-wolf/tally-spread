@@ -336,6 +336,7 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
           allowOverlay: true,
           contentAlign: isNumeric(c) ? "right" : "left",
           themeOverride: {
+            ...(c.style?.bold ? bold : {}),
             ...(c.type === "link" ? { textDark: dark ? "#7fb2ff" : "#2f5fc4" } : {}),
             ...(cell.warning ? { bgCell: warnBg } : {}),
           },
@@ -352,7 +353,11 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
         contentAlign: "right",
         themeOverride: cell.error
           ? { textDark: "#d9534f" }
-          : { textDark: dark ? "#c8c8c8" : "#333", ...(cell.warning ? { bgCell: warnBg } : {}) },
+          : {
+              textDark: dark ? "#c8c8c8" : "#333",
+              ...(c.style?.bold ? { ...bold, textDark: dark ? "#e8e8e8" : "#111" } : {}),
+              ...(cell.warning ? { bgCell: warnBg } : {}),
+            },
       };
     },
     [view, dark, totalRow],
@@ -443,12 +448,17 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
     [apply, setSelection],
   );
 
-  const onCellClicked = useCallback((cell: Item, e: { metaKey: boolean; ctrlKey: boolean }) => {
+  const onCellClicked = useCallback((cell: Item, e: { metaKey: boolean; ctrlKey: boolean; isDoubleClick?: boolean; bounds: Rectangle }) => {
     const v = viewRef.current;
     const col = v.columns[cell[0]];
+    // Double-clicking a calculated value means "show me how this is worked out".
+    if (col?.type === "calc" && e.isDoubleClick) {
+      onEditColumn(cell[0], e.bounds);
+      return;
+    }
     const url = col?.type === "link" ? v.rows[cell[1]]?.cells[cell[0]]?.raw : null;
     if (url && (e.metaKey || e.ctrlKey)) void openUrl(/^[a-z]+:\/\//i.test(url) ? url : `https://${url}`);
-  }, []);
+  }, [onEditColumn]);
 
   const onColumnMoved = useCallback(
     (from: number, to: number) => {

@@ -120,6 +120,7 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, functions 
   const [currency, setCurrency] = useState(init.currency);
   const [formula, setFormula] = useState(column?.formula_display ?? (column?.type === "calc" ? column.formula : ""));
   const [total, setTotal] = useState(column?.total ?? false);
+  const [bold, setBold] = useState(column?.style?.bold ?? false);
   const [preview, setPreview] = useState<{ ok: boolean; lines: string[] } | null>(null);
   const formulaRef = useRef<HTMLInputElement>(null);
   // Autocomplete for the name being typed in the formula.
@@ -202,7 +203,7 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, functions 
 
   const save = () => {
     if (!canSave) return;
-    const base = { name: finalName, var: finalVar, total };
+    const base = { name: finalName, var: finalVar, total, style: bold ? { bold: true } : {} };
     let spec: ColumnSpec;
     if (source === "calc") {
       spec = { ...base, type: "calc", formula: formula.trim(), ...(type === "money" ? { currency } : {}) } as ColumnSpec;
@@ -428,6 +429,10 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, functions 
         <label className="check">
           <input type="checkbox" checked={total} onChange={(e) => setTotal(e.target.checked)} />
           Show total (in the Total row and on section headings)
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={bold} onChange={(e) => setBold(e.target.checked)} />
+          <strong>Bold</strong>
         </label>
 
         <div className="ce-actions">

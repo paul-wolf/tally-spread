@@ -57,6 +57,7 @@ pub struct ColumnView {
     #[serde(flatten)]
     pub kind: ColumnKind,
     pub total: bool,
+    pub style: crate::ops::Style,
     /// Formula problems that affect the whole column.
     pub error: Option<String>,
 }
@@ -426,6 +427,7 @@ impl Project {
                 var: "__preview".into(),
                 kind: ColumnKind::Calc { formula: resolved.to_string(), currency },
                 total: false,
+                style: Default::default(),
             },
         };
         let view = self.sheet_view_with(sheet_id, rates, today, Some(extra))?;
@@ -704,6 +706,7 @@ impl Project {
                     },
                     kind: c.spec.kind.clone(),
                     total: c.spec.total,
+                    style: c.spec.style.clone(),
                     error: column_errors.get(&i).cloned(),
                 })
                 .collect(),
@@ -865,6 +868,7 @@ mod tests {
             spec: crate::ops::ColumnSpec {
                 name: "EUR".into(),
                 kind: ColumnKind::Calc { formula: "to(total_usd, EUR)".into(), currency: None },
+                style: Default::default(),
                 total: false,
                 var: String::new(),
             },
@@ -889,7 +893,7 @@ mod tests {
             sheet_id: "s".into(),
             col_id: "eur".into(),
             position: 10.0,
-            spec: crate::ops::ColumnSpec { name: "EUR".into(), var: String::new(), kind: ColumnKind::Calc { formula: "to(uah, EUR)".into(), currency: None }, total: false },
+            spec: crate::ops::ColumnSpec { name: "EUR".into(), var: String::new(), kind: ColumnKind::Calc { formula: "to(uah, EUR)".into(), currency: None }, total: false , style: Default::default()},
         })
         .unwrap();
         add_row(&mut p, "a", &[("uah", "4400"), ("qty", "1")]);
@@ -978,7 +982,7 @@ mod tests {
             sheet_id: "s".into(),
             col_id: "pasted".into(),
             position: 0.5,
-            spec: crate::ops::ColumnSpec { name: "Pasted".into(), var: String::new(), kind: ColumnKind::Text, total: false },
+            spec: crate::ops::ColumnSpec { name: "Pasted".into(), var: String::new(), kind: ColumnKind::Text, total: false , style: Default::default()},
         })
         .unwrap();
         add_row(&mut p, "a", &[("pasted", "UAH 3,250.00")]);
@@ -991,6 +995,7 @@ mod tests {
                 var: "pasted".into(),
                 kind: ColumnKind::Money { currency: cur("UAH") },
                 total: false,
+                style: Default::default(),
             },
         })
         .unwrap();
@@ -1019,6 +1024,7 @@ mod tests {
                 var: "unit_usd".into(),
                 kind: ColumnKind::Calc { formula: "coalesce(uah, usd)".into(), currency: Some(cur("USD")) },
                 total: false,
+                style: Default::default(),
             },
         })
         .unwrap();
@@ -1043,6 +1049,7 @@ mod tests {
                 var: "unit_usd".into(),
                 kind: ColumnKind::Calc { formula: "coalesce(uah, usd)".into(), currency: Some(cur("USD")) },
                 total: false,
+                style: Default::default(),
             },
         })
         .unwrap();

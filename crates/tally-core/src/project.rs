@@ -668,7 +668,7 @@ impl Project {
             }
             other => other.clone(),
         };
-        Ok(ColumnSpec { name, var, kind, total: spec.total })
+        Ok(ColumnSpec { name, var, kind, total: spec.total, style: spec.style.clone() })
     }
 
     fn write_spec(&self, sheet_id: &str, col_id: &str, spec: &ColumnSpec) -> Result<()> {
@@ -1025,7 +1025,7 @@ pub(crate) mod tests {
     }
 
     pub fn spec(name: &str, kind: K, total: bool) -> ColumnSpec {
-        ColumnSpec { name: name.into(), var: String::new(), kind, total }
+        ColumnSpec { name: name.into(), var: String::new(), kind, total, style: Default::default() }
     }
 
     /// A project with one sheet "s" laid out like a spending list.
@@ -1108,7 +1108,7 @@ pub(crate) mod tests {
         p.apply(Op::UpdateColumn {
             sheet_id: "s".into(),
             col_id: "unit".into(),
-            spec: ColumnSpec { name: "Each (USD)".into(), var: "each_usd".into(), kind: K::Calc { formula: "coalesce(to(uah, USD), usd)".into(), currency: None }, total: false },
+            spec: ColumnSpec { name: "Each (USD)".into(), var: "each_usd".into(), kind: K::Calc { formula: "coalesce(to(uah, USD), usd)".into(), currency: None }, total: false , style: Default::default()},
         })
         .unwrap();
         assert_eq!(p.column("s", "total").unwrap().spec.kind, K::Calc { formula: "unit * qty".into(), currency: None });
@@ -1171,7 +1171,7 @@ pub(crate) mod tests {
             sheet_id: "s".into(),
             col_id: String::new(),
             position: 50.0,
-            spec: ColumnSpec { name: name.into(), var: var.into(), kind: K::Text, total: false },
+            spec: ColumnSpec { name: name.into(), var: var.into(), kind: K::Text, total: false , style: Default::default()},
         };
         p.apply(add("Price (EUR)", "")).unwrap();
         p.apply(add("Price (EUR) 2", "")).unwrap();

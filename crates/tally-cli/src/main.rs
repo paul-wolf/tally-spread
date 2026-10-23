@@ -25,8 +25,8 @@ USAGE:
   tally projects                     list projects
   tally show <project> [sheet]       print a cost list with totals
   tally sql <project> <query>        run SQL against a project; each sheet is a table named after it
-  tally export <project> <file.xlsx> [sheet]
-                                     export a cost list to Excel
+  tally export <project> <file> [sheet]
+                                     export a sheet: .xlsx, .pdf, .csv or .json
   tally home                         print the Tally folder and this machine's id
 
 Environment: TALLY_HOME (default ~/Tally), TALLY_MACHINE (override the machine id).";
@@ -199,7 +199,14 @@ fn sheet_view(project: &str, sheet: Option<&str>) -> Result<tally_core::sheet::S
 
 fn export(project: &str, file: &str, sheet: Option<&str>) -> Res {
     let v = sheet_view(project, sheet)?;
-    tally_core::export::export_xlsx(&v, std::path::Path::new(file)).map_err(e)?;
+    let path = std::path::Path::new(file);
+    match path.extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+        "xlsx" => tally_core::export::export_xlsx(&v, path).map_err(e)?,
+        "csv" => std::fs::write(path, tally_core::formats::to_csv(&v).map_err(e)?).map_err(e)?,
+        "json" => std::fs::write(path, serde_json::to_string_pretty(&tally_core::formats::to_json(&v, project)).map_err(e)?).map_err(e)?,
+        "pdf" => std::fs::write(path, tally_core::formats::to_pdf(&v, project).map_err(e)?).map_err(e)?,
+        other => return Err(format!("can't export to .{other}: use .xlsx, .pdf, .csv or .json")),
+    }
     println!("wrote {file}");
     Ok(())
 }

@@ -263,7 +263,7 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
       view.columns.map((c, i) => ({
         id: c.col_id,
         title: c.name,
-        group: c.col_id,
+        group: c.var ? `${c.col_id} · ${c.var}` : c.col_id,
         width: widths[c.col_id] ?? defaultWidth(c, i),
         icon: ICON[c.type],
         hasMenu: true,

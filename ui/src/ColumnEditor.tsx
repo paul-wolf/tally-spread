@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { api } from "./api";
 import type { ColumnSpec, ColumnView } from "./types";
 
@@ -71,7 +71,10 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, at, onSave
   const [name, setName] = useState(column?.name ?? "");
   // The variable name follows the display name until it is edited by hand.
   const [varName, setVarName] = useState(column?.var ?? "");
-  const [varTouched, setVarTouched] = useState(!!column);
+  // An existing column's variable name follows renames when it still matches its
+  // display name (e.g. "E" -> e); one chosen by hand stays put.
+  const [varTouched, setVarTouched] = useState(!!column && column.var !== varFromName(column.name));
+  const [drag, setDrag] = useState<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
   const [source, setSource] = useState<Source>(init.source);
   const [type, setType] = useState<Type>(init.type);
   const [currency, setCurrency] = useState(init.currency);
@@ -86,7 +89,7 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, at, onSave
     type === "money" && currencyOk ? (source === "calc" ? `Total (${currency})` : `Price (${currency})`) : type === "number" ? "Qty" : "";
 
   useEffect(() => {
-    if (!varTouched) setVarName(varFromName(name || ""));
+    if (!varTouched) setVarName(name ? varFromName(name) : "");
   }, [name, varTouched]);
 
   // Try the formula as it is typed.
@@ -160,21 +163,38 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, at, onSave
     }
   };
 
-  const left = Math.max(8, Math.min(at.x, window.innerWidth - 430));
-  const top = Math.max(8, Math.min(at.y, window.innerHeight - 640));
+  const left = Math.max(8, Math.min(at.x, window.innerWidth - 430)) + drag.dx;
+  const top = Math.max(8, Math.min(at.y, window.innerHeight - 640)) + drag.dy;
+  // Drag the dialog by its title bar to see the sheet underneath.
+  const startDrag = (e: ReactPointerEvent) => {
+    if ((e.target as HTMLElement).closest("button,input")) return;
+    e.preventDefault();
+    const x0 = e.clientX - drag.dx;
+    const y0 = e.clientY - drag.dy;
+    const move = (ev: PointerEvent) => setDrag({ dx: ev.clientX - x0, dy: ev.clientY - y0 });
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+  // A variable name left over from an old display name (Qty still called e).
+  const derived = finalName ? varFromName(finalName) : "";
+  const staleVar = !!column && varTouched && finalVar === column.var && derived !== finalVar && derived !== "col";
 
   return (
     <>
       <div className="backdrop" onClick={onClose} />
       <form
         className="column-editor"
-        style={{ left, top, maxHeight: window.innerHeight - top - 8 }}
+        style={{ left, top, maxHeight: Math.max(240, window.innerHeight - top - 8) }}
         onSubmit={(e) => {
           e.preventDefault();
           save();
         }}
       >
-        <div className="ce-head">
+        <div className="ce-head" onPointerDown={startDrag} title="Drag to move">
           <span className="ce-id">{column ? column.col_id : "new"}</span>
           <span className="ce-title">{column ? "Edit column" : "New column"}</span>
         </div>
@@ -244,6 +264,15 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, at, onSave
             />
           </label>
         </div>
+        {staleVar && (
+          <div className="small">
+            <span className="muted">The variable name doesn't match the display name.</span>{" "}
+            <button type="button" className="suggest" onClick={() => setVarName(derived)}>
+              Use {derived}
+            </button>{" "}
+            <span className="muted">(formulas update themselves)</span>
+          </div>
+        )}
         {!name && suggestion && (
           <div className="small">
             <button type="button" className="suggest" onClick={() => setName(suggestion)}>

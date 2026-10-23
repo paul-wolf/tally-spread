@@ -9,8 +9,8 @@
 //! ```
 //!
 //! A column can be referred to by its ID (`c4`), its variable name (`price_uah`) or
-//! its display name in brackets (`[Price (UAH)]`). Three capital letters are a
-//! currency (`USD`). Formulas are stored with column IDs, so renaming a column never
+//! its display name in brackets (`[Price (UAH)]`). Three letters that are not a
+//! column are a currency (`USD`, `usd`); in `to(x, usd)` they always are. Formulas are stored with column IDs, so renaming a column never
 //! breaks one. Amounts keep their currency: adding UAH to USD is an error, never a
 //! silent mix; `to()` converts.
 
@@ -32,6 +32,8 @@ pub enum Expr {
     Col(String),
     /// A resolved currency code.
     Cur(Currency),
+    /// A parameter of a user function (by position).
+    Param(usize),
     Neg(Box<Expr>),
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Call(String, Vec<Expr>),
@@ -68,6 +70,183 @@ pub trait Context {
     fn column(&self, id: &str) -> Option<Value>;
     /// Convert an amount between currencies at the sheet's rates.
     fn convert(&self, amount: Decimal, from: &Currency, to: &Currency) -> Result<Decimal, String>;
+    /// User-defined functions available to formulas.
+    fn functions(&self) -> Option<&Functions> {
+        None
+    }
+    /// A user function's parameter values, while its body is evaluated.
+    fn param(&self, _i: usize) -> Option<Value> {
+        None
+    }
+    /// How deep in user-function calls this evaluation is.
+    fn depth(&self) -> usize {
+        0
+    }
+}
+
+// ------------------------------------------------------------------ user functions
+
+/// A function defined by the user, e.g. `vat(x) = x * 0.2`, usable in every formula.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UserFunction {
+    pub name: String,
+    pub params: Vec<String>,
+    /// The formula, written with the parameter names.
+    pub body: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// User functions, compiled and ready to call.
+#[derive(Clone, Debug, Default)]
+pub struct Functions {
+    map: std::collections::HashMap<String, (UserFunction, Expr)>,
+}
+
+const MAX_DEPTH: usize = 32;
+
+fn check_ident(kind: &str, n: &str) -> Result<(), String> {
+    let ok = n.starts_with(|c: char| c.is_ascii_lowercase()) && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("{kind} {n:?}: use lowercase letters, digits and _, starting with a letter"))
+    }
+}
+
+/// Compile a function body: names must be its parameters (or currencies).
+pub fn compile_function(f: &UserFunction) -> Result<Expr, String> {
+    check_ident("function name", &f.name)?;
+    if FUNCTIONS.contains(&f.name.as_str()) {
+        return Err(format!("{} is a built-in function", f.name));
+    }
+    for (i, p) in f.params.iter().enumerate() {
+        check_ident("parameter", p)?;
+        if f.params[..i].contains(p) {
+            return Err(format!("parameter {p} is listed twice"));
+        }
+    }
+    fn walk(e: &Expr, params: &[String]) -> Result<Expr, String> {
+        Ok(match e {
+            Expr::Name(n) => match params.iter().position(|p| p == n) {
+                Some(i) => Expr::Param(i),
+                None if is_currency_code(n) => Expr::Cur(Currency::new(n).map_err(|e| e.to_string())?),
+                None => return Err(format!("{n} is not a parameter (a function can only use its parameters)")),
+            },
+            Expr::Display(n) => return Err(format!("[{n}]: a function cannot refer to columns; pass them in")),
+            Expr::Neg(a) => Expr::Neg(Box::new(walk(a, params)?)),
+            Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(walk(a, params)?), Box::new(walk(b, params)?)),
+            Expr::Call(g, args) => Expr::Call(g.clone(), args.iter().map(|a| walk(a, params)).collect::<Result<_, _>>()?),
+            other => other.clone(),
+        })
+    }
+    walk(&parse(&f.body)?, &f.params)
+}
+
+impl Functions {
+    /// Compile a set of functions. Ones that do not compile are returned as problems.
+    pub fn new(list: impl IntoIterator<Item = UserFunction>) -> (Self, Vec<String>) {
+        let mut map = std::collections::HashMap::new();
+        let mut problems = Vec::new();
+        for f in list {
+            match compile_function(&f) {
+                Ok(e) => {
+                    map.insert(f.name.clone(), (f, e));
+                }
+                Err(e) => problems.push(format!("function {}: {e}", f.name)),
+            }
+        }
+        (Self { map }, problems)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&(UserFunction, Expr)> {
+        self.map.get(name)
+    }
+
+    pub fn list(&self) -> Vec<&UserFunction> {
+        let mut v: Vec<_> = self.map.values().map(|(f, _)| f).collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
+    /// Functions this one calls, directly or not, would call it back?
+    pub fn has_loop(&self, name: &str) -> bool {
+        fn calls(e: &Expr, out: &mut Vec<String>) {
+            match e {
+                Expr::Call(f, args) => {
+                    out.push(f.clone());
+                    args.iter().for_each(|a| calls(a, out));
+                }
+                Expr::Neg(a) => calls(a, out),
+                Expr::Bin(_, a, b) => {
+                    calls(a, out);
+                    calls(b, out);
+                }
+                _ => {}
+            }
+        }
+        let mut stack = vec![name.to_string()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(n) = stack.pop() {
+            let Some((_, body)) = self.map.get(&n) else { continue };
+            let mut out = Vec::new();
+            calls(body, &mut out);
+            for c in out {
+                if c == name {
+                    return true;
+                }
+                if seen.insert(c.clone()) {
+                    stack.push(c);
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Evaluate a formula that uses no columns (e.g. `vat(100)` when trying out a
+/// function). Currency conversion is not available here.
+pub fn eval_standalone(src: &str, functions: &Functions) -> Value {
+    struct Plain<'a>(&'a Functions);
+    impl Context for Plain<'_> {
+        fn column(&self, _id: &str) -> Option<Value> {
+            None
+        }
+        fn convert(&self, _a: Decimal, from: &Currency, to: &Currency) -> Result<Decimal, String> {
+            Err(format!("{from}→{to}: conversions need a sheet's rates; try it in a column"))
+        }
+        fn functions(&self) -> Option<&Functions> {
+            Some(self.0)
+        }
+    }
+    match parse(src).and_then(|e| resolve(&e, &[])) {
+        Ok(e) => eval(&e, &Plain(functions)),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// Evaluating a user function's body: its parameters, and everything else from the caller.
+struct Call<'a> {
+    args: Vec<Value>,
+    parent: &'a dyn Context,
+}
+
+impl Context for Call<'_> {
+    fn column(&self, _id: &str) -> Option<Value> {
+        None
+    }
+    fn convert(&self, amount: Decimal, from: &Currency, to: &Currency) -> Result<Decimal, String> {
+        self.parent.convert(amount, from, to)
+    }
+    fn functions(&self) -> Option<&Functions> {
+        self.parent.functions()
+    }
+    fn param(&self, i: usize) -> Option<Value> {
+        self.args.get(i).cloned()
+    }
+    fn depth(&self) -> usize {
+        self.parent.depth() + 1
+    }
 }
 
 // ------------------------------------------------------------------ parsing
@@ -263,8 +442,9 @@ pub fn parse(src: &str) -> Result<Expr, String> {
 fn check_calls(e: &Expr) -> Result<(), String> {
     match e {
         Expr::Call(name, args) => {
+            // Other names are user functions, checked when evaluated.
             if !FUNCTIONS.contains(&name.as_str()) {
-                return Err(format!("unknown function {name}() (available: {})", FUNCTIONS.join(", ")));
+                return args.iter().try_for_each(check_calls);
             }
             let ok = match name.as_str() {
                 "to" => args.len() == 2,
@@ -302,7 +482,25 @@ fn is_currency_code(n: &str) -> bool {
 /// Resolve names to column IDs and currencies: `c4` or `price_uah` (any case) or
 /// `[Price (UAH)]` is a column; three capital letters are a currency.
 pub fn resolve(e: &Expr, cols: &[ColRef]) -> Result<Expr, String> {
+    resolve_in(e, cols, false)
+}
+
+/// `currency_slot`: the second argument of `to()`, where three letters are
+/// always a currency, in any case (`to(c3, usd)`).
+fn resolve_in(e: &Expr, cols: &[ColRef], currency_slot: bool) -> Result<Expr, String> {
+    let as_currency = |n: &str| -> Option<Expr> {
+        if n.len() == 3 && n.chars().all(|c| c.is_ascii_alphabetic()) {
+            Currency::new(n).ok().map(Expr::Cur)
+        } else {
+            None
+        }
+    };
     let by_name = |n: &str| -> Result<Expr, String> {
+        if currency_slot {
+            if let Some(c) = as_currency(n) {
+                return Ok(c);
+            }
+        }
         if let Some(c) = cols.iter().find(|c| c.id == n || c.var == n) {
             return Ok(Expr::Col(c.id.clone()));
         }
@@ -312,6 +510,10 @@ pub fn resolve(e: &Expr, cols: &[ColRef]) -> Result<Expr, String> {
         if let Some(c) = cols.iter().find(|c| c.var.eq_ignore_ascii_case(n) || c.id.eq_ignore_ascii_case(n)) {
             return Ok(Expr::Col(c.id.clone()));
         }
+        // Not a column: three letters are a currency, whatever the case.
+        if let Some(c) = as_currency(n) {
+            return Ok(c);
+        }
         Err(format!("no column called {n}"))
     };
     Ok(match e {
@@ -320,9 +522,15 @@ pub fn resolve(e: &Expr, cols: &[ColRef]) -> Result<Expr, String> {
             Some(c) => Expr::Col(c.id.clone()),
             None => return Err(format!("no column called [{n}]")),
         },
-        Expr::Neg(a) => Expr::Neg(Box::new(resolve(a, cols)?)),
-        Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(resolve(a, cols)?), Box::new(resolve(b, cols)?)),
-        Expr::Call(f, args) => Expr::Call(f.clone(), args.iter().map(|a| resolve(a, cols)).collect::<Result<_, _>>()?),
+        Expr::Neg(a) => Expr::Neg(Box::new(resolve_in(a, cols, false)?)),
+        Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(resolve_in(a, cols, false)?), Box::new(resolve_in(b, cols, false)?)),
+        Expr::Call(f, args) => Expr::Call(
+            f.clone(),
+            args.iter()
+                .enumerate()
+                .map(|(i, a)| resolve_in(a, cols, f == "to" && i == 1))
+                .collect::<Result<_, _>>()?,
+        ),
         other => other.clone(),
     })
 }
@@ -405,6 +613,7 @@ impl fmt::Display for Expr {
         }
         match self {
             Expr::Num(n) => write!(f, "{n}"),
+            Expr::Param(i) => write!(f, "${i}"),
             Expr::Name(n) | Expr::Col(n) => write!(f, "{n}"),
             Expr::Display(n) => write!(f, "[{n}]"),
             Expr::Cur(c) => write!(f, "{c}"),
@@ -447,6 +656,7 @@ pub fn eval(e: &Expr, ctx: &dyn Context) -> Value {
         Expr::Num(n) => Value::Number(*n),
         Expr::Col(id) => ctx.column(id).unwrap_or_else(|| Value::Error(format!("column {id} no longer exists"))),
         Expr::Cur(c) => Value::Currency(c.clone()),
+        Expr::Param(i) => ctx.param(*i).unwrap_or(Value::Error("missing parameter".into())),
         Expr::Name(n) => Value::Error(format!("no column called {n}")),
         Expr::Display(n) => Value::Error(format!("no column called [{n}]")),
         Expr::Neg(a) => match eval(a, ctx) {
@@ -607,7 +817,19 @@ fn call(name: &str, args: &[Expr], ctx: &dyn Context) -> Value {
             };
             eval(if truthy { &args[1] } else { &args[2] }, ctx)
         }
-        other => Value::Error(format!("unknown function {other}()")),
+        other => {
+            let Some((f, body)) = ctx.functions().and_then(|fs| fs.get(other)) else {
+                return Value::Error(format!("unknown function {other}()"));
+            };
+            if args.len() != f.params.len() {
+                return Value::Error(format!("{other}() takes {} argument(s): {}", f.params.len(), f.params.join(", ")));
+            }
+            if ctx.depth() >= MAX_DEPTH {
+                return Value::Error(format!("{other}(): functions call each other in a loop"));
+            }
+            let values = args.iter().map(|a| eval(a, ctx)).collect();
+            eval(body, &Call { args: values, parent: ctx })
+        }
     }
 }
 
@@ -666,6 +888,12 @@ mod tests {
     }
 
     #[test]
+    fn currencies_in_any_case() {
+        assert_eq!(compile("coalesce(to(c4, usd), c5)"), compile("coalesce(to(c4, USD), c5)"));
+        assert_eq!(compile("to(price_uah, eur)").to_string(), "to(c4, EUR)");
+    }
+
+    #[test]
     fn unknown_names_are_reported() {
         assert_eq!(resolve(&parse("price * qty").unwrap(), &cols()).unwrap_err(), "no column called price");
         assert!(resolve(&parse("[Nope]").unwrap(), &cols()).is_err());
@@ -707,7 +935,6 @@ mod tests {
     fn parse_errors_are_readable() {
         assert!(parse("").is_err());
         assert!(parse("qty *").unwrap_err().contains("too soon"));
-        assert!(parse("sum(qty)").unwrap_err().contains("unknown function"));
         assert!(parse("to(qty)").unwrap_err().contains("arguments"));
         assert!(parse("(1 + 2").unwrap_err().contains(")"));
     }
@@ -729,6 +956,45 @@ mod tests {
         assert_eq!(parse("(a - b) - (c - d)").unwrap().to_string(), "a - b - (c - d)");
         let f = compile("round(price_uah / 3)");
         assert_eq!(resolve(&parse(&f.to_string()).unwrap(), &cols()).unwrap(), f);
+    }
+
+    struct WithFns(Row, Functions);
+    impl Context for WithFns {
+        fn column(&self, id: &str) -> Option<Value> {
+            self.0.column(id)
+        }
+        fn convert(&self, a: Decimal, f: &Currency, t: &Currency) -> Result<Decimal, String> {
+            self.0.convert(a, f, t)
+        }
+        fn functions(&self) -> Option<&Functions> {
+            Some(&self.1)
+        }
+    }
+
+    fn uf(name: &str, params: &[&str], body: &str) -> UserFunction {
+        UserFunction { name: name.into(), params: params.iter().map(|p| p.to_string()).collect(), body: body.into(), description: String::new() }
+    }
+
+    #[test]
+    fn user_functions() {
+        let (fns, problems) = Functions::new([
+            uf("vat", &["x"], "x * 0.2"),
+            uf("with_vat", &["x"], "x + vat(x)"),
+            uf("usd", &["x"], "to(x, USD)"),
+            uf("bad", &["x"], "x * qty"),
+            uf("ping", &["x"], "pong(x)"),
+            uf("pong", &["x"], "ping(x)"),
+        ]);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("qty is not a parameter"));
+        assert!(fns.has_loop("ping") && !fns.has_loop("with_vat"));
+        let r = WithFns(row(&[("c4", Value::Money(dec!(4400), c("UAH"))), ("c7", Value::Number(dec!(2)))]), fns);
+        assert_eq!(eval(&compile("with_vat(price_uah)"), &r), Value::Money(dec!(5280.0), c("UAH")));
+        assert_eq!(eval(&compile("usd(price_uah) * qty"), &r), Value::Money(dec!(200), c("USD")));
+        assert!(matches!(eval(&compile("vat(1, 2)"), &r), Value::Error(e) if e.contains("takes 1")));
+        assert!(matches!(eval(&compile("ping(1)"), &r), Value::Error(e) if e.contains("loop")));
+        assert!(matches!(eval(&compile("nope(1)"), &r), Value::Error(e) if e.contains("unknown function")));
+        assert!(compile_function(&uf("round", &["x"], "x")).is_err());
     }
 
     #[test]

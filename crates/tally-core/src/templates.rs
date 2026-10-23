@@ -36,6 +36,7 @@ pub fn sheet_ops(template: &str, sheet_id: &str, name: &str) -> Vec<Op> {
                 col(sheet_id, 6, "Unit (USD)", calc("coalesce(to(price_uah, USD), price_usd)"), false),
                 col(sheet_id, 7, "Qty", ColumnKind::Number, false),
                 col(sheet_id, 8, "Total (USD)", calc("unit_usd * qty"), true),
+                Op::SetSheetBase { sheet_id: sheet_id.into(), base: Some(Currency::new("USD").expect("valid")) },
             ]);
         }
         _ => {

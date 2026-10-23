@@ -27,6 +27,7 @@ export type Op =
   | { op: "set_sheet_rates"; sheet_id: string; rates: RateMode }
   | { op: "set_sheet_sources"; sheet_id: string; sources: RateSource[] }
   | { op: "set_sheet_fixed_rates"; sheet_id: string; rates: FixedRate[] }
+  | { op: "set_sheet_base"; sheet_id: string; base: string | null }
   | { op: "add_column"; sheet_id: string; col_id: string; position: number; spec: ColumnSpec }
   | { op: "update_column"; sheet_id: string; col_id: string; spec: ColumnSpec }
   | { op: "move_column"; sheet_id: string; col_id: string; position: number }
@@ -80,6 +81,31 @@ export interface RateLeg {
   date: string;
 }
 
+export interface CardEntry {
+  currency: string;
+  /** 1 base = rate currency */
+  rate: string | null;
+  pinned: boolean;
+  legs: RateLeg[];
+  rate_date: string | null;
+  fetched_at: string | null;
+  error: string | null;
+}
+
+export interface RateCard {
+  base: string;
+  base_chosen: boolean;
+  as_of: string;
+  entries: CardEntry[];
+}
+
+export interface UserFunction {
+  name: string;
+  params: string[];
+  body: string;
+  description: string;
+}
+
 export interface SheetView {
   sheet_id: string;
   name: string;
@@ -88,6 +114,7 @@ export interface SheetView {
   sources: RateSource[];
   effective_sources: RateSource[];
   fixed_rates: FixedRate[];
+  rate_card: RateCard;
   columns: ColumnView[];
   rows: RowView[];
   totals: (TotalView | null)[];
@@ -102,6 +129,7 @@ export interface SheetInfo {
   rates: RateMode;
   sources: RateSource[];
   fixed_rates: FixedRate[];
+  base: string | null;
 }
 
 export interface ProjectSettings {
@@ -126,6 +154,7 @@ export interface Snapshot {
   can_undo: boolean;
   can_redo: boolean;
   rate_status: { source: RateSource; label: string; latest: string | null }[];
+  functions: UserFunction[];
   notices: string[];
 }
 

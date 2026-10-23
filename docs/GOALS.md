@@ -19,6 +19,10 @@ Check every proposal and design against these goals and flag any conflict.
 - **Flexible columns.** Columns are lettered A, B, C… like Excel and named per sheet; they can be inserted, deleted, moved, renamed and retyped at any time. Types: text, number, link, money in one currency (e.g. separate "UAH" and "USD" price columns), calculated.
 - **Calculated columns, not cell formulas.** One formula per column (e.g. `coalesce(to(UAH, USD), USD)`, `[Unit USD] * Qty`), evaluated with exact decimals; literal values and formulas never mix in one column. Free-form per-cell formulas are not planned; if they turn out to be needed, embed IronCalc rather than write an engine.
 - **Sections with subtotals** replace blank-row groups and hand-built subtotal cells.
+- **Column naming (decided 2026-10-23):** every column has an invariant ID (c1, c2… never reused), a display name ("Price (USD)") and a variable name ("price_usd"). Formulas refer to columns by variable name, ID or [display name], are same-row, and are stored by ID so renames never break them. Row margin shows plain positions.
+- **Rate card (decided 2026-10-23):** one rate per currency per sheet against a base currency, all conversions through it; viewable with source, rate date and fetch time; floating (latest daily) or pegged (date or pinned values). Per-row purchase-date rates are a later option.
+- **User functions (decided 2026-10-23):** defined by the user as formulas over parameters (e.g. `vat(x) = x * 0.2`), stored in the shared library, usable in every sheet and project.
+- **Excel import (planned):** pasting brings values only; importing an .xlsx will recognise repeating row formulas and turn them into calculated columns.
 - **Rates:** the user chooses the provider per sheet; ECB preferred. ECB does not publish UAH, so NBU fills that gap automatically. Fixed hand-set rates per sheet (e.g. 1 USD = 44.92 UAH) win over every source.
 - **Typical spending layout:** Item | Link | Note | UAH | USD | Unit USD (calc) | Qty | Total USD (calc, totalled). Spending lists of this kind are in USD and unrelated to tax; the GBP/HMRC setup applies to tax work only.
 

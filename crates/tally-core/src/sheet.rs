@@ -32,6 +32,8 @@ pub struct SheetView {
     /// Rate sources actually used, in order of preference.
     pub effective_sources: Vec<RateSource>,
     pub fixed_rates: Vec<FixedRate>,
+    /// The one rate per currency this sheet uses.
+    pub rate_card: RateCard,
     pub columns: Vec<ColumnView>,
     pub rows: Vec<RowView>,
     /// Sheet totals, one per column (`None` where the column is not totalled).
@@ -109,47 +111,145 @@ fn input_value(kind: &ColumnKind, raw: Option<&String>) -> Value {
     }
 }
 
+/// The sheet's rate card: every currency gets exactly one rate against the base
+/// currency for the sheet's date, and all conversions go through it, so a currency
+/// never has two rates in one sheet and cross rates always agree.
+#[derive(Clone, Debug, Serialize)]
+pub struct RateCard {
+    pub base: Currency,
+    /// False when the base was chosen automatically.
+    pub base_chosen: bool,
+    pub as_of: NaiveDate,
+    pub entries: Vec<CardEntry>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CardEntry {
+    pub currency: Currency,
+    /// `1 base = rate currency`, as text.
+    pub rate: Option<String>,
+    /// Set by hand for this sheet (pegged).
+    pub pinned: bool,
+    /// Where the rate comes from (several when crossed through another currency).
+    pub legs: Vec<RateLeg>,
+    /// The date the rate applies to (the oldest of its legs).
+    pub rate_date: Option<NaiveDate>,
+    /// When Tally fetched it (the oldest of its legs), if known.
+    pub fetched_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub error: Option<String>,
+}
+
 struct Converter<'a> {
     rates: &'a RateTable,
+    base: Currency,
     fixed: Vec<(Currency, Currency, Decimal)>,
     as_of: NaiveDate,
     sources: Vec<RateSource>,
-    used: RefCell<Vec<RateLeg>>,
+    card: RefCell<Vec<(CardEntry, std::result::Result<Decimal, String>)>>,
 }
 
 impl Converter<'_> {
+    /// `1 base = rate c`, computed once per currency and remembered.
+    fn rate_of(&self, c: &Currency) -> std::result::Result<Decimal, String> {
+        if c == &self.base {
+            return Ok(Decimal::ONE);
+        }
+        if let Some((_, r)) = self.card.borrow().iter().find(|(e, _)| &e.currency == c) {
+            return r.clone();
+        }
+        let mut entry = CardEntry { currency: c.clone(), rate: None, pinned: false, legs: vec![], rate_date: None, fetched_at: None, error: None };
+        let pinned = self.fixed.iter().find_map(|(b, q, r)| {
+            if b == &self.base && q == c {
+                Some(*r)
+            } else if b == c && q == &self.base {
+                Some(Decimal::ONE / r)
+            } else {
+                None
+            }
+        });
+        let result = match pinned {
+            Some(r) => {
+                entry.pinned = true;
+                Ok(r)
+            }
+            None => match self.rates.convert(Decimal::ONE, &self.base, c, self.as_of, &self.sources) {
+                Ok(conv) => {
+                    entry.rate_date = conv.legs.iter().map(|l| l.date).min();
+                    entry.fetched_at = conv.legs.iter().filter_map(|l| self.rates.fetched_at(l)).min();
+                    entry.legs = conv
+                        .legs
+                        .into_iter()
+                        .map(|l| if l.inverted { RateLeg { from: l.to, to: l.from, inverted: false, ..l } } else { l })
+                        .collect();
+                    Ok(conv.amount)
+                }
+                Err(e) => Err(e.to_string()),
+            },
+        };
+        match &result {
+            Ok(r) => entry.rate = Some(r.normalize().round_dp(10).to_string()),
+            Err(e) => entry.error = Some(e.clone()),
+        }
+        self.card.borrow_mut().push((entry, result.clone()));
+        result
+    }
+
     fn convert(&self, amount: Decimal, from: &Currency, to: &Currency) -> std::result::Result<Decimal, String> {
         if from == to {
             return Ok(amount);
         }
-        let mut used = self.used.borrow_mut();
-        for (b, q, r) in &self.fixed {
-            let leg = RateLeg { from: b.clone(), to: q.clone(), rate: *r, inverted: false, source: RateSource::Manual, date: self.as_of };
-            if b == from && q == to {
-                if !used.contains(&leg) {
-                    used.push(leg);
-                }
-                return Ok(amount * r);
-            }
-            if b == to && q == from {
-                if !used.contains(&leg) {
-                    used.push(leg);
-                }
-                return Ok(amount / r);
-            }
-        }
-        let c = self.rates.convert(amount, from, to, self.as_of, &self.sources).map_err(|e| e.to_string())?;
-        for leg in c.legs {
-            let leg = if leg.inverted { RateLeg { from: leg.to, to: leg.from, inverted: false, ..leg } } else { leg };
-            if !used.contains(&leg) {
-                used.push(leg);
-            }
-        }
-        Ok(c.amount)
+        let rf = self.rate_of(from)?;
+        let rt = self.rate_of(to)?;
+        // amount in base = amount / rf; in target = that × rt. Multiply first.
+        Ok(amount * rt / rf)
     }
 }
 
+/// Currencies a sheet uses: money columns and the targets of `to()`.
+fn sheet_currencies(columns: &[ColumnInfo], cols: &[formula::ColRef]) -> (Vec<Currency>, Vec<Currency>) {
+    let mut all = Vec::new();
+    let mut targets = Vec::new();
+    fn walk(e: &Expr, targets: &mut Vec<Currency>) {
+        match e {
+            Expr::Call(f, args) => {
+                if f == "to" {
+                    if let Some(Expr::Cur(c)) = args.get(1) {
+                        targets.push(c.clone());
+                    }
+                }
+                args.iter().for_each(|a| walk(a, targets));
+            }
+            Expr::Neg(a) => walk(a, targets),
+            Expr::Bin(_, a, b) => {
+                walk(a, targets);
+                walk(b, targets);
+            }
+            _ => {}
+        }
+    }
+    for c in columns {
+        match &c.spec.kind {
+            ColumnKind::Money { currency } => all.push(currency.clone()),
+            ColumnKind::Calc { formula: src } => {
+                if let Ok(e) = formula::parse(src).and_then(|e| formula::resolve(&e, cols)) {
+                    walk(&e, &mut targets);
+                }
+            }
+            _ => {}
+        }
+    }
+    all.extend(targets.iter().cloned());
+    let mut unique = Vec::new();
+    for c in all {
+        if !unique.contains(&c) {
+            unique.push(c);
+        }
+    }
+    (unique, targets)
+}
+
 struct RowCtx<'a> {
+    functions: &'a formula::Functions,
     columns: &'a [ColumnInfo],
     values: &'a HashMap<String, Value>,
     conv: &'a Converter<'a>,
@@ -165,6 +265,10 @@ impl Context for RowCtx<'_> {
 
     fn convert(&self, amount: Decimal, from: &Currency, to: &Currency) -> std::result::Result<Decimal, String> {
         self.conv.convert(amount, from, to)
+    }
+
+    fn functions(&self) -> Option<&formula::Functions> {
+        Some(self.functions)
     }
 }
 
@@ -341,18 +445,35 @@ impl Project {
             }
             s
         };
-        let fixed = sheet
-            .fixed_rates
-            .iter()
-            .filter_map(|f| Decimal::from_str(&f.rate).ok().map(|r| (f.base.clone(), f.quote.clone(), r)))
-            .collect();
-        let conv = Converter { rates, fixed, as_of, sources: effective_sources.clone(), used: RefCell::new(vec![]) };
-
         let col_refs: Vec<formula::ColRef> = columns
             .iter()
             .map(|c| formula::ColRef { id: c.col_id.clone(), var: c.spec.var.clone(), display: c.spec.name.clone() })
             .collect();
         let (order, column_errors) = calc_order(&columns, &col_refs);
+
+        // The rate card's base: chosen for the sheet, else the currency most
+        // formulas convert to, else the project's reporting currency.
+        let (currencies, targets) = sheet_currencies(&columns, &col_refs);
+        let base = sheet.base.clone().unwrap_or_else(|| {
+            let mut best: Option<(&Currency, usize)> = None;
+            for t in &targets {
+                let n = targets.iter().filter(|x| *x == t).count();
+                if best.map_or(true, |(_, m)| n > m) {
+                    best = Some((t, n));
+                }
+            }
+            best.map(|(c, _)| c.clone()).unwrap_or_else(|| settings.reporting_currency.clone())
+        });
+        let fixed = sheet
+            .fixed_rates
+            .iter()
+            .filter_map(|f| Decimal::from_str(&f.rate).ok().map(|r| (f.base.clone(), f.quote.clone(), r)))
+            .collect();
+        let conv = Converter { rates, base: base.clone(), fixed, as_of, sources: effective_sources.clone(), card: RefCell::new(vec![]) };
+        // Every currency the sheet uses gets its line on the card, used yet or not.
+        for c in &currencies {
+            let _ = conv.rate_of(c);
+        }
         let per_line = settings.rounding_scope == RoundingScope::PerLine;
         let mut warnings: Vec<String> = Vec::new();
         let mut warn = |w: String| {
@@ -374,7 +495,7 @@ impl Project {
                 }
                 for (i, expr) in &order {
                     let v = {
-                        let ctx = RowCtx { columns: &columns, values: &values, conv: &conv };
+                        let ctx = RowCtx { functions: self.functions(), columns: &columns, values: &values, conv: &conv };
                         formula::eval(expr, &ctx)
                     };
                     let v = match v {
@@ -449,7 +570,31 @@ impl Project {
             })
             .collect();
 
-        let mut legs = conv.used.into_inner();
+        let mut card_entries: Vec<CardEntry> = conv.card.into_inner().into_iter().map(|(e, _)| e).collect();
+        card_entries.sort_by(|a, b| a.currency.cmp(&b.currency));
+        for e in &card_entries {
+            if let Some(err) = &e.error {
+                warn(format!("rate card: {err}"));
+            }
+        }
+        let mut legs: Vec<RateLeg> = Vec::new();
+        for e in &card_entries {
+            if e.pinned {
+                legs.push(RateLeg {
+                    from: base.clone(),
+                    to: e.currency.clone(),
+                    rate: Decimal::from_str(e.rate.as_deref().unwrap_or("0")).unwrap_or_default(),
+                    inverted: false,
+                    source: RateSource::Manual,
+                    date: as_of,
+                });
+            }
+            for l in &e.legs {
+                if !legs.contains(l) {
+                    legs.push(l.clone());
+                }
+            }
+        }
         legs.sort_by(|a, b| a.source.cmp(&b.source).then(a.from.cmp(&b.from)).then(a.to.cmp(&b.to)));
         let stale: Vec<String> = legs
             .iter()
@@ -469,6 +614,7 @@ impl Project {
             sources: sheet.sources,
             effective_sources,
             fixed_rates: sheet.fixed_rates,
+            rate_card: RateCard { base, base_chosen: sheet.base.is_some(), as_of, entries: card_entries },
             columns: columns
                 .iter()
                 .enumerate()
@@ -665,6 +811,34 @@ mod tests {
     }
 
     #[test]
+    fn rate_card_gives_one_rate_per_currency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = spending_project(tmp.path());
+        p.apply(Op::SetSheetSources { sheet_id: "s".into(), sources: vec![RateSource::Ecb] }).unwrap();
+        p.apply(Op::AddColumn {
+            sheet_id: "s".into(),
+            col_id: "eur".into(),
+            position: 10.0,
+            spec: crate::ops::ColumnSpec { name: "EUR".into(), var: String::new(), kind: ColumnKind::Calc { formula: "to(uah, EUR)".into() }, total: false },
+        })
+        .unwrap();
+        add_row(&mut p, "a", &[("uah", "4400"), ("qty", "1")]);
+        let v = p.sheet_view("s", &rates(), d("2026-10-22")).unwrap();
+        let card = &v.rate_card;
+        // Base chosen automatically: the currency formulas convert to most (USD).
+        assert_eq!(card.base.code(), "USD");
+        assert!(!card.base_chosen);
+        let codes: Vec<_> = card.entries.iter().map(|e| e.currency.code()).collect();
+        assert_eq!(codes, ["EUR", "UAH"]);
+        let uah = &card.entries[1];
+        assert_eq!(uah.rate.as_deref(), Some("44"));
+        assert_eq!(uah.legs[0].source, RateSource::Nbu);
+        // UAH -> EUR goes through the card (UAH -> USD at NBU, USD -> EUR at ECB),
+        // never NBU's direct EUR rate, so it agrees with the USD column.
+        assert_eq!(cell(&v, 0, "eur").value.as_deref(), Some("90.91"));
+    }
+
+    #[test]
     fn fixed_rate_wins() {
         let tmp = tempfile::tempdir().unwrap();
         let mut p = spending_project(tmp.path());
@@ -686,7 +860,7 @@ mod tests {
         add_row(&mut p, "a", &[("uah", "100"), ("qty", "1")]);
         // No rates at all.
         let v = p.sheet_view("s", &RateTable::new(), d("2026-10-22")).unwrap();
-        assert!(cell(&v, 0, "unit").error.as_deref().unwrap().contains("UAH→USD"));
+        assert!(cell(&v, 0, "unit").error.as_deref().unwrap().contains("UAH"));
         assert!(!v.warnings.is_empty());
         assert!(v.totals[5].is_none() || !v.totals[5].as_ref().unwrap().complete);
     }

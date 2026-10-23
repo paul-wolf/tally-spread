@@ -18,9 +18,10 @@ Status: early but usable. Sheets with your own columns, calculated columns, sect
   - `unit_usd * qty`: line total
   - `to(c8, EUR)` or `[Total (USD)] * 1.2`: columns by ID or display name work too
 
-  Functions: `to`, `coalesce`, `round`, `abs`, `min`, `max`, `if`. Three capital letters are a currency (`USD`). Formulas are stored by column ID, so renaming never breaks one. Amounts keep their currency: adding UAH to USD is an error, never a silent mix. The column dialog previews the result as you type. There are no per-cell formulas.
+  Built-in functions: `to`, `coalesce`, `round`, `abs`, `min`, `max`, `if`, plus your own. Three letters that aren't a column are a currency (`USD` or `usd`). Formulas are stored by column ID, so renaming never breaks one. Amounts keep their currency: adding UAH to USD is an error, never a silent mix. The column dialog previews the result as you type. There are no per-cell formulas.
 - **Sections.** Any row can be a section heading; columns marked "Add up" get a subtotal on the heading and a sheet total.
-- **Exchange rates.** ECB (preferred), NBU and HMRC monthly, updated automatically. ECB does not publish hryvnia, so NBU covers UAH. Per sheet: preferred source, live or locked to a date, and fixed rates of your own (e.g. 1 USD = 44.92 UAH) that win over every source. The rates used are listed under the totals.
+- **Rate card per sheet.** Each currency gets exactly one rate against the sheet's base currency (e.g. USD), and every conversion goes through it, so a currency never has two rates in one sheet and cross rates always agree. Open it from the toolbar to see each rate's source, the date it applies to and when it was fetched. Rates float with the latest daily rates (ECB preferred; NBU covers hryvnia, which ECB does not publish; HMRC monthly available) or are pegged to a date; any rate can be pinned by hand.
+- **Your own functions.** Define `vat(x) = x * 0.2` or `usd(x) = to(x, USD)` once (ƒ Functions) and use them in any formula in every sheet and project; they live in the shared library and sync between machines. Functions can use their parameters, numbers, currencies, built-ins and each other (loops are refused).
 - **Exact money**: decimal arithmetic, per-currency rounding; amounts typed as `₴12 499,50`, `$ 71.50`, `1,234.56` or `12.50 EUR`.
 - **Typing and pasting like a spreadsheet.** Blank rows are always there to type into. Paste from Excel or Google Sheets anywhere (a heading row is skipped; values that don't fit a column are left out and reported). Copy, cut, transposed copy and paste, fill down, undo/redo of everything.
 - **Sheets as tabs** (blank, or a spending-list template); **projects** as folders.
@@ -43,6 +44,7 @@ docs                goals and design notes
 ```
 ~/Tally/                      (TALLY_HOME; sync this folder between machines)
   library/fx_rates/<machine>.jsonl
+  library/functions/<machine>.jsonl
   projects/<project>/
     project.json              settings: currencies, rate sources, rounding, tax home
     ops/<machine>.jsonl       append-only log of operations

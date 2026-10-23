@@ -217,3 +217,45 @@ button.danger { color: var(--error); }
 .ce-examples { border-collapse: collapse; font-size: 12px; }
 .ce-examples td { padding: 2px 10px 2px 0; color: var(--muted); }
 .ce-examples td.mono { color: var(--text); white-space: nowrap; }
+
+/* panels: rate card, functions */
+.panel {
+  position: fixed;
+  z-index: 51;
+  top: 70px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100vh - 110px);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.22);
+}
+.panel-head { display: flex; align-items: baseline; gap: 10px; }
+.panel-head .muted { flex: 1; font-size: 12px; }
+.close-x { border: none; background: none; font-size: 18px; color: var(--muted); padding: 0 4px; }
+.small { font-size: 11.5px; }
+.rc-controls { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.rc-controls label { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.rc-controls input, .rc-controls select { color: var(--text); }
+.rc-table, .fn-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.rc-table th { text-align: left; color: var(--muted); font-weight: 500; font-size: 11.5px; border-bottom: 1px solid var(--line); padding: 4px 8px 6px 0; }
+.rc-table td, .fn-table td { padding: 6px 8px 6px 0; border-bottom: 1px solid var(--line); }
+.rc-table .num { text-align: right; }
+.rc-table input.pin { width: 90px; }
+.bad-row td { color: var(--error); }
+.fn-table tr { cursor: pointer; }
+.fn-table tr:hover td { background: var(--bg); }
+.fn-form { display: flex; flex-direction: column; gap: 10px; }
+.fn-def { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.fn-def input { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.fn-def .fn-body { flex: 1; min-width: 200px; }
+.fn-try { display: flex; align-items: center; gap: 8px; }
+.fn-try .ok { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.rate-card-btn { font-variant-numeric: tabular-nums; }

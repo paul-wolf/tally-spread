@@ -80,6 +80,8 @@ pub struct SheetInfo {
     /// Rate sources chosen for this sheet (empty = the project's).
     pub sources: Vec<RateSource>,
     pub fixed_rates: Vec<FixedRate>,
+    /// Rate card base currency chosen for this sheet.
+    pub base: Option<Currency>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -105,7 +107,8 @@ CREATE TABLE sheets (
     archived BOOLEAN NOT NULL DEFAULT false,
     rates VARCHAR NOT NULL DEFAULT 'live',
     sources VARCHAR NOT NULL DEFAULT '[]',
-    fixed_rates VARCHAR NOT NULL DEFAULT '[]'
+    fixed_rates VARCHAR NOT NULL DEFAULT '[]',
+    base VARCHAR NOT NULL DEFAULT ''
 );
 CREATE TABLE columns (
     sheet_id VARCHAR NOT NULL,
@@ -141,6 +144,8 @@ pub struct Project {
     redo: Vec<Op>,
     /// Problems met while replaying logs (e.g. an edit to a row another machine deleted).
     replay_warnings: Vec<String>,
+    /// User functions from the library, available to formulas.
+    functions: formula::Functions,
 }
 
 /// Read a project's settings without opening it.
@@ -185,6 +190,7 @@ impl Project {
             undo: vec![],
             redo: vec![],
             replay_warnings: vec![],
+            functions: Default::default(),
         };
         p.rebuild()?;
         Ok(p)
@@ -208,6 +214,15 @@ impl Project {
     /// The project's DuckDB connection (tables: sheets, columns, sheet_rows, cells).
     pub fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Make the library's user functions available to this project's formulas.
+    pub fn set_functions(&mut self, functions: formula::Functions) {
+        self.functions = functions;
+    }
+
+    pub fn functions(&self) -> &formula::Functions {
+        &self.functions
     }
 
     pub fn replay_warnings(&self) -> &[String] {
@@ -398,6 +413,12 @@ impl Project {
                     Op::SetSheetSources { sheet_id: sheet_id.clone(), sources: unique },
                     Op::SetSheetSources { sheet_id: sheet_id.clone(), sources: old },
                 ))
+            }
+            Op::SetSheetBase { sheet_id, base } => {
+                let old = self.sheet(sheet_id)?.base;
+                let text = base.as_ref().map(|c| c.code().to_string()).unwrap_or_default();
+                self.conn.execute("UPDATE sheets SET base = ? WHERE sheet_id = ?", params![text, sheet_id])?;
+                Ok((op.clone(), Op::SetSheetBase { sheet_id: sheet_id.clone(), base: old }))
             }
             Op::SetSheetFixedRates { sheet_id, rates } => {
                 let old = self.sheet(sheet_id)?.fixed_rates;
@@ -644,6 +665,7 @@ impl Project {
             undo: vec![],
             redo: vec![],
             replay_warnings: vec![],
+            functions: Default::default(),
         };
         let (entries, _) = probe.read_log()?;
         drop(probe);
@@ -781,7 +803,7 @@ impl Project {
 
     pub fn sheets(&self, include_archived: bool) -> Result<Vec<SheetInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT sheet_id, name, archived, rates, sources, fixed_rates FROM sheets ORDER BY position, sheet_id",
+            "SELECT sheet_id, name, archived, rates, sources, fixed_rates, base FROM sheets ORDER BY position, sheet_id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -791,11 +813,12 @@ impl Project {
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (sheet_id, name, archived, rates, sources, fixed) = row?;
+            let (sheet_id, name, archived, rates, sources, fixed, base) = row?;
             if archived && !include_archived {
                 continue;
             }
@@ -806,6 +829,7 @@ impl Project {
                 rates: RateMode::from_db(&rates)?,
                 sources: serde_json::from_str(&sources)?,
                 fixed_rates: serde_json::from_str(&fixed)?,
+                base: if base.is_empty() { None } else { Some(Currency::new(&base)?) },
             });
         }
         Ok(out)

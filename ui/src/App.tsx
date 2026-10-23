@@ -4,9 +4,11 @@ import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { api, newId } from "./api";
 import { ColumnEditor } from "./ColumnEditor";
-import { money, parseTsv, shortDate, todayIso, toTsv, transpose } from "./format";
+import { FunctionsPanel } from "./FunctionsPanel";
+import { RateCardPanel } from "./RateCardPanel";
+import { money, parseTsv, shortDate, toTsv, transpose } from "./format";
 import { SheetGrid, emptySelection, opsForBlock, opsForClear, positionBetween, selectedBlock } from "./SheetGrid";
-import type { ColumnSpec, FixedRate, Op, RateSource, SheetView, Snapshot } from "./types";
+import type { ColumnSpec, Op, RateSource, SheetView, Snapshot } from "./types";
 import { SOURCE_LABEL } from "./types";
 
 const SYNC_EVERY_MS = 5000;
@@ -40,6 +42,7 @@ export default function App() {
   const [message, setMessage] = useState<{ text: string; error?: boolean } | null>(null);
   const [rateBusy, setRateBusy] = useState(false);
   const [editing, setEditing] = useState<Editing | null>(null);
+  const [panel, setPanel] = useState<"rates" | "functions" | null>(null);
   const dark = usePrefersDark();
 
   const sheetRef = useRef<string | null>(null);
@@ -226,7 +229,7 @@ export default function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (!mod || isTyping(e) || editing) return;
+      if (!mod || isTyping(e) || editing || panel) return;
       const k = e.key.toLowerCase();
       if (k === "z") {
         e.preventDefault();
@@ -263,7 +266,7 @@ export default function App() {
     // Capture phase, so the shortcuts work while the grid has focus.
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [run, paste, copy, insertRowAbove, toggleSection, editing]);
+  }, [run, paste, copy, insertRowAbove, toggleSection, editing, panel]);
 
   const openColumnEditor = useCallback((index: number | "new", at: Rectangle) => {
     const v = snapRef.current?.sheet;
@@ -325,6 +328,8 @@ export default function App() {
         onRedo={() => run(api.redo(sheetRef.current))}
         onInsertRow={insertRowAbove}
         onToggleSection={toggleSection}
+        onOpenRateCard={() => setPanel("rates")}
+        onOpenFunctions={() => setPanel("functions")}
         onAddColumn={(at) => {
           const v = snapRef.current?.sheet;
           if (!v) return;
@@ -424,6 +429,17 @@ export default function App() {
         />
       )}
 
+      {panel === "rates" && view && <RateCardPanel view={view} onApply={apply} onClose={() => setPanel(null)} />}
+      {panel === "functions" && (
+        <FunctionsPanel
+          functions={snap.functions}
+          sheetId={sheetId}
+          onSaved={show}
+          onError={fail}
+          onClose={() => setPanel(null)}
+        />
+      )}
+
       {(message || snap.notices.length > 0) && (
         <div className={`toast ${message?.error ? "error" : ""}`} onClick={() => setMessage(null)}>
           {message?.text ?? snap.notices[0]}
@@ -449,11 +465,12 @@ function TopBar(props: {
   onInsertRow: () => void;
   onToggleSection: () => void;
   onAddColumn: (at: Rectangle) => void;
+  onOpenRateCard: () => void;
+  onOpenFunctions: () => void;
 }) {
   const { snap } = props;
   const view = snap.sheet;
   const [newProject, setNewProject] = useState<string | null>(null);
-  const [showFixed, setShowFixed] = useState(false);
 
   const locked = view?.rates.mode === "locked" ? view.rates.date : null;
   const firstSource = view?.effective_sources[0] ?? "ecb";
@@ -509,46 +526,14 @@ function TopBar(props: {
 
       {view && (
         <div className="group">
-          <label className="field">
-            <span>Rates</span>
-            <select
-              value={firstSource}
-              title="Preferred source; others fill gaps (ECB has no hryvnia, so NBU covers UAH)"
-              onChange={(e) =>
-                props.onApply({ op: "set_sheet_sources", sheet_id: view.sheet_id, sources: [e.target.value as RateSource] })
-              }
-            >
-              <option value="ecb">ECB</option>
-              <option value="nbu">NBU</option>
-              <option value="hmrc_monthly">HMRC monthly</option>
-            </select>
-            <select
-              value={locked ? "locked" : "live"}
-              onChange={(e) =>
-                props.onApply({
-                  op: "set_sheet_rates",
-                  sheet_id: view.sheet_id,
-                  rates: e.target.value === "live" ? { mode: "live" } : { mode: "locked", date: todayIso() },
-                })
-              }
-            >
-              <option value="live">Live</option>
-              <option value="locked">Locked</option>
-            </select>
-            {locked && (
-              <input
-                type="date"
-                value={locked}
-                onChange={(e) =>
-                  e.target.value &&
-                  props.onApply({ op: "set_sheet_rates", sheet_id: view.sheet_id, rates: { mode: "locked", date: e.target.value } })
-                }
-              />
-            )}
-            <button onClick={() => setShowFixed((s) => !s)} className={view.fixed_rates.length ? "on" : ""}>
-              {view.fixed_rates.length ? `Fixed: ${view.fixed_rates.map((r) => `${r.base}=${r.rate}${r.quote}`).join(", ")}` : "Fixed rate…"}
-            </button>
-          </label>
+          <button className="rate-card-btn" onClick={props.onOpenRateCard} title="Open the rate card: every rate this sheet uses">
+            Rates: {view.rate_card.base} base · {SOURCE_LABEL[firstSource]} ·{" "}
+            {locked ? `pegged ${locked}` : "floating"}
+            {view.fixed_rates.length > 0 && ` · ${view.fixed_rates.length} pinned`}
+          </button>
+          <button onClick={props.onOpenFunctions} title="Your own functions, usable in every formula">
+            ƒ Functions
+          </button>
         </div>
       )}
 
@@ -576,50 +561,7 @@ function TopBar(props: {
         </button>
       </div>
 
-      {showFixed && view && (
-        <FixedRates
-          rates={view.fixed_rates}
-          onSave={(rates) => {
-            props.onApply({ op: "set_sheet_fixed_rates", sheet_id: view.sheet_id, rates });
-            setShowFixed(false);
-          }}
-          onCancel={() => setShowFixed(false)}
-        />
-      )}
     </header>
-  );
-}
-
-/** Hand-set rates for this sheet; they win over every source (like a fixed 44.92 UAH per USD). */
-function FixedRates(props: { rates: FixedRate[]; onSave: (r: FixedRate[]) => void; onCancel: () => void }) {
-  const [rows, setRows] = useState<FixedRate[]>(props.rates.length ? props.rates : [{ base: "USD", quote: "UAH", rate: "" }]);
-  const set = (i: number, patch: Partial<FixedRate>) => setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
-  return (
-    <form
-      className="rate-form"
-      onSubmit={(e) => {
-        e.preventDefault();
-        props.onSave(rows.filter((r) => r.rate.trim()).map((r) => ({ ...r, base: r.base.toUpperCase(), quote: r.quote.toUpperCase() })));
-      }}
-    >
-      <span>Fixed rates for this sheet (empty rate removes it):</span>
-      {rows.map((r, i) => (
-        <span key={i} className="fixed-row">
-          1 <input value={r.base} onChange={(e) => set(i, { base: e.target.value })} size={4} /> =
-          <input autoFocus={i === 0} value={r.rate} onChange={(e) => set(i, { rate: e.target.value })} placeholder="44.92" size={9} />
-          <input value={r.quote} onChange={(e) => set(i, { quote: e.target.value })} size={4} />
-        </span>
-      ))}
-      <button type="button" onClick={() => setRows((rs) => [...rs, { base: "EUR", quote: "UAH", rate: "" }])}>
-        + pair
-      </button>
-      <button type="submit" className="primary">
-        Save
-      </button>
-      <button type="button" onClick={props.onCancel}>
-        Cancel
-      </button>
-    </form>
   );
 }
 

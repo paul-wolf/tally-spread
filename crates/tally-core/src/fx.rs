@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +91,8 @@ pub struct Conversion {
 pub struct RateTable {
     // (source, base, quote) -> date -> record
     series: HashMap<(RateSource, Currency, Currency), BTreeMap<NaiveDate, RateRecord>>,
+    // When each record was fetched, where known.
+    fetched: HashMap<(RateSource, Currency, Currency, NaiveDate), DateTime<Utc>>,
 }
 
 impl RateTable {
@@ -109,6 +111,17 @@ impl RateTable {
                 .or_default()
                 .insert(r.date, r);
         }
+    }
+
+    /// Remember when a record was fetched.
+    pub fn set_fetched(&mut self, r: &RateRecord, at: DateTime<Utc>) {
+        self.fetched.insert((r.source, r.base.clone(), r.quote.clone(), r.date), at);
+    }
+
+    /// When the rate used by a leg was fetched, if known.
+    pub fn fetched_at(&self, leg: &RateLeg) -> Option<DateTime<Utc>> {
+        let (b, q) = if leg.inverted { (&leg.to, &leg.from) } else { (&leg.from, &leg.to) };
+        self.fetched.get(&(leg.source, b.clone(), q.clone(), leg.date)).copied()
     }
 
     pub fn len(&self) -> usize {

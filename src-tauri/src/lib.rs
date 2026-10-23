@@ -13,6 +13,7 @@ use tally_core::home::{machine_id, tally_home};
 use tally_core::library::Library;
 use tally_core::project::{read_settings, SheetInfo, FORMAT};
 use tally_core::sheet::SheetView;
+use tally_core::formula::{self, UserFunction, Value};
 use tally_core::templates;
 use tally_core::{Currency, Op, Project, ProjectSettings};
 use tauri::State;
@@ -59,6 +60,7 @@ pub struct Snapshot {
     pub can_undo: bool,
     pub can_redo: bool,
     pub rate_status: Vec<RateStatus>,
+    pub functions: Vec<UserFunction>,
     pub notices: Vec<String>,
 }
 
@@ -146,7 +148,9 @@ fn init() -> Result<Inner, String> {
         Some(dir) => (Project::open(projects_dir(&home).join(&dir), &machine).map_err(err)?, dir),
         None => create_project_in(&home, "My project", &machine)?,
     };
-    Ok(Inner { home, machine, library, rates, project, project_dir_name })
+    let mut inner = Inner { home, machine, library, rates, project, project_dir_name };
+    inner.load_functions()?;
+    Ok(inner)
 }
 
 // ------------------------------------------------------------------ snapshot
@@ -177,6 +181,7 @@ impl Inner {
             sheet,
             can_undo: self.project.can_undo(),
             can_redo: self.project.can_redo(),
+            functions: self.project.functions().list().into_iter().cloned().collect(),
             rate_status: [RateSource::HmrcMonthly, RateSource::Nbu, RateSource::Ecb]
                 .into_iter()
                 .map(|s| RateStatus { source: s, label: s.label().into(), latest: self.rates.latest_date(s) })
@@ -188,6 +193,13 @@ impl Inner {
     fn reload_rates(&mut self) -> CmdResult<()> {
         self.rates = self.library.rates().map_err(err)?;
         Ok(())
+    }
+
+    /// Give the open project the library's user functions.
+    fn load_functions(&mut self) -> CmdResult<Vec<String>> {
+        let (fns, problems) = self.library.functions().map_err(err)?;
+        self.project.set_functions(fns);
+        Ok(problems)
     }
 }
 
@@ -226,7 +238,10 @@ fn sync(state: State<AppState>, sheet_id: Option<String>) -> CmdResult<Option<Sn
     let mut inner = state.0.lock().map_err(err)?;
     let before = inner.rates.len();
     inner.reload_rates()?;
-    let changed = inner.project.refresh().map_err(err)? || inner.rates.len() != before;
+    let before_fns = inner.project.functions().list().len();
+    inner.load_functions()?;
+    let fns_changed = inner.project.functions().list().len() != before_fns;
+    let changed = inner.project.refresh().map_err(err)? || inner.rates.len() != before || fns_changed;
     if changed {
         Ok(Some(inner.snapshot(sheet_id.as_deref(), vec![])?))
     } else {
@@ -239,6 +254,7 @@ fn open_project(state: State<AppState>, dir_name: String) -> CmdResult<Snapshot>
     let mut inner = state.0.lock().map_err(err)?;
     let dir = projects_dir(&inner.home).join(&dir_name);
     inner.project = Project::open(dir, &inner.machine).map_err(err)?;
+    inner.load_functions()?;
     inner.project_dir_name = dir_name.clone();
     let _ = fs::write(inner.home.join(".last-project"), &dir_name);
     inner.snapshot(None, vec![])
@@ -249,6 +265,7 @@ fn create_project(state: State<AppState>, name: String) -> CmdResult<Snapshot> {
     let mut inner = state.0.lock().map_err(err)?;
     let (project, dir_name) = create_project_in(&inner.home, &name, &inner.machine)?;
     inner.project = project;
+    inner.load_functions()?;
     inner.project_dir_name = dir_name.clone();
     let _ = fs::write(inner.home.join(".last-project"), &dir_name);
     inner.snapshot(None, vec![])
@@ -336,6 +353,42 @@ fn preview_formula(state: State<AppState>, sheet_id: String, col_id: Option<Stri
     inner.project.preview_formula(&sheet_id, col_id.as_deref(), &formula, &inner.rates, today()).map_err(err)
 }
 
+/// Save a user function (shared by every sheet and project); `old_name` renames one.
+#[tauri::command]
+fn save_function(state: State<AppState>, function: UserFunction, old_name: Option<String>, sheet_id: Option<String>) -> CmdResult<Snapshot> {
+    let mut inner = state.0.lock().map_err(err)?;
+    inner.library.save_function(function, old_name.as_deref()).map_err(err)?;
+    let problems = inner.load_functions()?;
+    inner.snapshot(sheet_id.as_deref(), problems)
+}
+
+#[tauri::command]
+fn delete_function(state: State<AppState>, name: String, sheet_id: Option<String>) -> CmdResult<Snapshot> {
+    let mut inner = state.0.lock().map_err(err)?;
+    inner.library.delete_function(&name).map_err(err)?;
+    let problems = inner.load_functions()?;
+    inner.snapshot(sheet_id.as_deref(), problems)
+}
+
+/// Try an expression such as `vat(100)` with a draft of a function in place.
+#[tauri::command]
+fn try_function(state: State<AppState>, function: UserFunction, expression: String) -> CmdResult<String> {
+    let inner = state.0.lock().map_err(err)?;
+    formula::compile_function(&function)?;
+    let mut all: Vec<UserFunction> =
+        inner.project.functions().list().into_iter().filter(|f| f.name != function.name).cloned().collect();
+    all.push(function);
+    let (fns, _) = formula::Functions::new(all);
+    Ok(match formula::eval_standalone(&expression, &fns) {
+        Value::Empty => "(empty)".into(),
+        Value::Number(n) => n.normalize().to_string(),
+        Value::Money(n, c) => format!("{} {c}", n.normalize()),
+        Value::Text(t) => t,
+        Value::Currency(c) => c.to_string(),
+        Value::Error(e) => return Err(e),
+    })
+}
+
 #[tauri::command]
 fn export_xlsx(state: State<AppState>, sheet_id: String, path: String) -> CmdResult<()> {
     let inner = state.0.lock().map_err(err)?;
@@ -365,6 +418,9 @@ pub fn run() {
             add_manual_rate,
             create_sheet,
             preview_formula,
+            save_function,
+            delete_function,
+            try_function,
             export_xlsx
         ])
         .run(tauri::generate_context!())

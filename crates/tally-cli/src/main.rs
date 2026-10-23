@@ -159,7 +159,13 @@ fn project_dir(name: &str) -> PathBuf {
 }
 
 fn open(name: &str) -> Result<Project, String> {
-    Project::open(project_dir(name), &machine_id()).map_err(|err| format!("{name}: {err}"))
+    let mut p = Project::open(project_dir(name), &machine_id()).map_err(|err| format!("{name}: {err}"))?;
+    let (fns, problems) = library()?.functions().map_err(e)?;
+    for pr in problems {
+        eprintln!("warning: {pr}");
+    }
+    p.set_functions(fns);
+    Ok(p)
 }
 
 fn projects() -> Res {

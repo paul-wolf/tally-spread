@@ -131,6 +131,8 @@ pub enum Op {
     SetSheetRates { sheet_id: String, rates: RateMode },
     /// Rate sources in order of preference; empty means the project's.
     SetSheetSources { sheet_id: String, sources: Vec<RateSource> },
+    /// The rate card's base currency (`None` = choose automatically).
+    SetSheetBase { sheet_id: String, base: Option<Currency> },
     /// Hand-set rates for this sheet; they win over every source.
     SetSheetFixedRates { sheet_id: String, rates: Vec<FixedRate> },
 

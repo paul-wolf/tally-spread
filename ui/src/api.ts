@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Op, ProjectSettings, RateSource, RefreshReport, Snapshot } from "./types";
+import type { Op, ProjectSettings, RateSource, RefreshReport, Snapshot, UserFunction } from "./types";
 
 // Thin typed wrappers over the Tauri commands in src-tauri/src/lib.rs.
 export const api = {
@@ -17,6 +17,10 @@ export const api = {
     invoke<Snapshot>("save_settings", { settings, sheetId }),
   refreshRates: () => invoke<RefreshReport[]>("refresh_rates"),
   importRates: (source: RateSource, path: string) => invoke<number>("import_rates", { source, path }),
+  saveFunction: (fn: UserFunction, oldName: string | null, sheetId: string | null) =>
+    invoke<Snapshot>("save_function", { function: fn, oldName, sheetId }),
+  deleteFunction: (name: string, sheetId: string | null) => invoke<Snapshot>("delete_function", { name, sheetId }),
+  tryFunction: (fn: UserFunction, expression: string) => invoke<string>("try_function", { function: fn, expression }),
   exportXlsx: (sheetId: string, path: string) => invoke<void>("export_xlsx", { sheetId, path }),
 };
 

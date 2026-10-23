@@ -64,6 +64,25 @@ impl FromStr for Currency {
     }
 }
 
+/// Active ISO 4217 currency codes. In formulas these are predefined names
+/// (written in capitals, e.g. `USD`).
+pub const ISO_CODES: &[&str] = &[
+    "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM", "BBD", "BDT", "BGN", "BHD", "BIF",
+    "BMD", "BND", "BOB", "BRL", "BSD", "BTN", "BWP", "BYN", "BZD", "CAD", "CDF", "CHF", "CLP", "CNY", "COP", "CRC",
+    "CUP", "CVE", "CZK", "DJF", "DKK", "DOP", "DZD", "EGP", "ERN", "ETB", "EUR", "FJD", "FKP", "GBP", "GEL", "GHS",
+    "GIP", "GMD", "GNF", "GTQ", "GYD", "HKD", "HNL", "HTG", "HUF", "IDR", "ILS", "INR", "IQD", "IRR", "ISK", "JMD",
+    "JOD", "JPY", "KES", "KGS", "KHR", "KMF", "KPW", "KRW", "KWD", "KYD", "KZT", "LAK", "LBP", "LKR", "LRD", "LSL",
+    "LYD", "MAD", "MDL", "MGA", "MKD", "MMK", "MNT", "MOP", "MRU", "MUR", "MVR", "MWK", "MXN", "MYR", "MZN", "NAD",
+    "NGN", "NIO", "NOK", "NPR", "NZD", "OMR", "PAB", "PEN", "PGK", "PHP", "PKR", "PLN", "PYG", "QAR", "RON", "RSD",
+    "RUB", "RWF", "SAR", "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE", "SOS", "SRD", "SSP", "STN", "SVC", "SYP",
+    "SZL", "THB", "TJS", "TMT", "TND", "TOP", "TRY", "TTD", "TWD", "TZS", "UAH", "UGX", "USD", "UYU", "UZS", "VES",
+    "VND", "VUV", "WST", "XAF", "XAG", "XAU", "XCD", "XDR", "XOF", "XPD", "XPF", "XPT", "YER", "ZAR", "ZMW", "ZWG",
+];
+
+pub fn is_iso_code(code: &str) -> bool {
+    ISO_CODES.binary_search(&code).is_ok()
+}
+
 /// How amounts are rounded to a currency's minor units.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -253,6 +272,12 @@ mod tests {
         assert_eq!(round(dec!(2.345), &gbp, Rounding::HalfEven), dec!(2.34));
         assert_eq!(round(dec!(1234.5), &jpy, Rounding::HalfUp), dec!(1235));
         assert_eq!(format_amount(dec!(3), &gbp), "3.00");
+    }
+
+    #[test]
+    fn iso_list_is_sorted() {
+        assert!(ISO_CODES.windows(2).all(|w| w[0] < w[1]));
+        assert!(is_iso_code("UAH") && is_iso_code("USD") && !is_iso_code("usd") && !is_iso_code("QTY"));
     }
 
     #[test]

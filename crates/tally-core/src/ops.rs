@@ -23,7 +23,14 @@ pub enum ColumnKind {
     Money { currency: Currency },
     /// Computed for every row from a formula, e.g. `coalesce(to(price_uah, USD), price_usd)`.
     /// Stored with column IDs (`coalesce(to(c4, USD), c5)`), so renames never break it.
-    Calc { formula: String },
+    /// With a `currency`, results are amounts in that currency: other currencies are
+    /// converted at the sheet's rates (so `coalesce(price_uah, price_usd)` in a USD
+    /// column needs no `to()`), and plain numbers are taken as amounts in it.
+    Calc {
+        formula: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        currency: Option<Currency>,
+    },
 }
 
 impl ColumnKind {

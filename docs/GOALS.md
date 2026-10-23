@@ -23,6 +23,9 @@ Check every proposal and design against these goals and flag any conflict.
 - **Rate card (decided 2026-10-23):** one rate per currency per sheet against a base currency, all conversions through it; viewable with source, rate date and fetch time; floating (latest daily) or pegged (date or pinned values). Per-row purchase-date rates are a later option.
 - **User functions (decided 2026-10-23):** defined by the user as formulas over parameters (e.g. `vat(x) = x * 0.2`), stored in the shared library, usable in every sheet and project.
 - **Excel import (planned):** pasting brings values only; importing an .xlsx will recognise repeating row formulas and turn them into calculated columns.
+- **Values vs type (decided 2026-10-23):** a column's values are typed in or calculated; its type is text, number, money (currency) or link. A calculated Money (USD) column converts its results to USD at the rate card, so `coalesce(price_uah, price_usd)` needs no `to()`.
+- **Currency names (decided 2026-10-23):** ISO codes are predefined names in capitals (`USD`); variable names are lowercase; no special cases.
+- **Guiding principle:** lean on implied semantics. Most spreadsheet work is repetitive, so Tally should infer what it can (currency from the column, names from the type, rate-card base from the formulas) and ask only when it can't.
 - **Rates:** the user chooses the provider per sheet; ECB preferred. ECB does not publish UAH, so NBU fills that gap automatically. Fixed hand-set rates per sheet (e.g. 1 USD = 44.92 UAH) win over every source.
 - **Typical spending layout:** Item | Link | Note | UAH | USD | Unit USD (calc) | Qty | Total USD (calc, totalled). Spending lists of this kind are in USD and unrelated to tax; the GBP/HMRC setup applies to tax work only.
 

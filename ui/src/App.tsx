@@ -382,6 +382,7 @@ export default function App() {
           sheetId={view.sheet_id}
           column={editedColumn}
           others={view.columns.filter((c) => c !== editedColumn)}
+          baseCurrency={view.rate_card.base}
           at={editing.at}
           onClose={() => setEditing(null)}
           onSave={async (spec: ColumnSpec) => {
@@ -441,8 +442,14 @@ export default function App() {
       )}
 
       {(message || snap.notices.length > 0) && (
-        <div className={`toast ${message?.error ? "error" : ""}`} onClick={() => setMessage(null)}>
-          {message?.text ?? snap.notices[0]}
+        <div className={`toast ${message?.error ? "error" : ""}`}>
+          <span className="toast-text">{message?.text ?? snap.notices[0]}</span>
+          <button className="toast-btn" title="Copy" onClick={() => void writeText(message?.text ?? snap.notices[0])}>
+            Copy
+          </button>
+          <button className="toast-btn" title="Dismiss" onClick={() => setMessage(null)}>
+            ×
+          </button>
         </div>
       )}
     </div>
@@ -568,6 +575,7 @@ function TopBar(props: {
 // ------------------------------------------------------------------ totals
 
 function Totals({ view }: { view: SheetView }) {
+  // (writeText is the clipboard plugin's, imported above.)
   const mode = view.rates.mode === "live" ? `Live rates, ${shortDate(view.as_of)}` : `Rates locked at ${shortDate(view.as_of)}`;
   const totals = view.columns.map((c, i) => ({ c, t: view.totals[i] })).filter((x) => x.t);
   return (
@@ -590,11 +598,18 @@ function Totals({ view }: { view: SheetView }) {
           {view.rates_used.length > 0 && ": "}
           {view.rates_used.map((l) => `1 ${l.from} = ${l.rate} ${l.to} (${SOURCE_LABEL[l.source]} ${l.date})`).join(" · ")}
         </div>
-        {view.warnings.map((w) => (
-          <div key={w} className="warning">
-            {w}
+        {view.warnings.length > 0 && (
+          <div className="warnings">
+            {view.warnings.map((w) => (
+              <div key={w} className="warning">
+                {w}
+              </div>
+            ))}
+            <button className="copy-link" onClick={() => void writeText(view.warnings.join("\n"))}>
+              Copy {view.warnings.length > 1 ? "all" : ""}
+            </button>
           </div>
-        ))}
+        )}
       </div>
     </section>
   );

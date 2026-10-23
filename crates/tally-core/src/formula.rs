@@ -9,8 +9,9 @@
 //! ```
 //!
 //! A column can be referred to by its ID (`c4`), its variable name (`price_uah`) or
-//! its display name in brackets (`[Price (UAH)]`). Three letters that are not a
-//! column are a currency (`USD`, `usd`); in `to(x, usd)` they always are. Formulas are stored with column IDs, so renaming a column never
+//! its display name in brackets (`[Price (UAH)]`). Currency codes are predefined
+//! names written in capitals (`USD`, `UAH`); variable names are lowercase, so the
+//! two never clash. Formulas are stored with column IDs, so renaming a column never
 //! breaks one. Amounts keep their currency: adding UAH to USD is an error, never a
 //! silent mix; `to()` converts.
 
@@ -476,7 +477,7 @@ pub struct ColRef {
 }
 
 fn is_currency_code(n: &str) -> bool {
-    n.len() == 3 && n.chars().all(|c| c.is_ascii_uppercase())
+    crate::money::is_iso_code(n)
 }
 
 /// Resolve names to column IDs and currencies: `c4` or `price_uah` (any case) or
@@ -485,34 +486,21 @@ pub fn resolve(e: &Expr, cols: &[ColRef]) -> Result<Expr, String> {
     resolve_in(e, cols, false)
 }
 
-/// `currency_slot`: the second argument of `to()`, where three letters are
-/// always a currency, in any case (`to(c3, usd)`).
-fn resolve_in(e: &Expr, cols: &[ColRef], currency_slot: bool) -> Result<Expr, String> {
-    let as_currency = |n: &str| -> Option<Expr> {
-        if n.len() == 3 && n.chars().all(|c| c.is_ascii_alphabetic()) {
-            Currency::new(n).ok().map(Expr::Cur)
-        } else {
-            None
-        }
-    };
+fn resolve_in(e: &Expr, cols: &[ColRef], _currency_slot: bool) -> Result<Expr, String> {
     let by_name = |n: &str| -> Result<Expr, String> {
-        if currency_slot {
-            if let Some(c) = as_currency(n) {
-                return Ok(c);
-            }
-        }
         if let Some(c) = cols.iter().find(|c| c.id == n || c.var == n) {
             return Ok(Expr::Col(c.id.clone()));
         }
+        // Currency codes are predefined names, written in capitals: USD, UAH, EUR.
         if is_currency_code(n) {
             return Ok(Expr::Cur(Currency::new(n).map_err(|e| e.to_string())?));
         }
         if let Some(c) = cols.iter().find(|c| c.var.eq_ignore_ascii_case(n) || c.id.eq_ignore_ascii_case(n)) {
             return Ok(Expr::Col(c.id.clone()));
         }
-        // Not a column: three letters are a currency, whatever the case.
-        if let Some(c) = as_currency(n) {
-            return Ok(c);
+        let upper = n.to_ascii_uppercase();
+        if is_currency_code(&upper) {
+            return Err(format!("no column called {n}. Did you mean the currency {upper}?"));
         }
         Err(format!("no column called {n}"))
     };
@@ -888,9 +876,11 @@ mod tests {
     }
 
     #[test]
-    fn currencies_in_any_case() {
-        assert_eq!(compile("coalesce(to(c4, usd), c5)"), compile("coalesce(to(c4, USD), c5)"));
-        assert_eq!(compile("to(price_uah, eur)").to_string(), "to(c4, EUR)");
+    fn currencies_are_predefined_capital_names() {
+        assert_eq!(compile("to(price_uah, EUR)").to_string(), "to(c4, EUR)");
+        let err = resolve(&parse("to(c4, usd)").unwrap(), &cols()).unwrap_err();
+        assert_eq!(err, "no column called usd. Did you mean the currency USD?");
+        assert!(resolve(&parse("to(c4, QQQ)").unwrap(), &cols()).is_err(), "not an ISO code");
     }
 
     #[test]

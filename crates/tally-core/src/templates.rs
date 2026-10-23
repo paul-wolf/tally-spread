@@ -26,14 +26,15 @@ pub fn sheet_ops(template: &str, sheet_id: &str, name: &str) -> Vec<Op> {
     let mut ops = vec![Op::CreateSheet { sheet_id: sheet_id.into(), name: name.into() }];
     match template {
         "spending" => {
-            let calc = |f: &str| ColumnKind::Calc { formula: f.into() };
+            let usd = || Some(Currency::new("USD").expect("valid"));
+            let calc = |f: &str| ColumnKind::Calc { formula: f.into(), currency: usd() };
             ops.extend([
                 col(sheet_id, 1, "Item", ColumnKind::Text, false),
                 col(sheet_id, 2, "Link", ColumnKind::Link, false),
                 col(sheet_id, 3, "Note", ColumnKind::Text, false),
                 col(sheet_id, 4, "Price (UAH)", money("UAH"), false),
                 col(sheet_id, 5, "Price (USD)", money("USD"), false),
-                col(sheet_id, 6, "Unit (USD)", calc("coalesce(to(price_uah, USD), price_usd)"), false),
+                col(sheet_id, 6, "Unit (USD)", calc("coalesce(price_uah, price_usd)"), false),
                 col(sheet_id, 7, "Qty", ColumnKind::Number, false),
                 col(sheet_id, 8, "Total (USD)", calc("unit_usd * qty"), true),
                 Op::SetSheetBase { sheet_id: sheet_id.into(), base: Some(Currency::new("USD").expect("valid")) },

@@ -104,9 +104,24 @@ fn input_value(kind: &ColumnKind, raw: Option<&String>) -> Value {
     let Some(raw) = raw else { return Value::Empty };
     match kind {
         ColumnKind::Text | ColumnKind::Link => Value::Text(raw.clone()),
-        ColumnKind::Number => Decimal::from_str(raw).map_or_else(|_| Value::Error(format!("{raw:?} is not a number")), Value::Number),
-        ColumnKind::Money { currency } => Decimal::from_str(raw)
-            .map_or_else(|_| Value::Error(format!("{raw:?} is not an amount")), |d| Value::Money(d, currency.clone())),
+        // Stored values are normalised, but a column whose type changed may hold
+        // text such as "UAH 3,250.00" or "$ 71.50": read it leniently.
+        ColumnKind::Number => match Decimal::from_str(raw) {
+            Ok(d) => Value::Number(d),
+            Err(_) => match crate::money::parse_amount(raw) {
+                Ok((d, None)) => Value::Number(d),
+                _ => Value::Error(format!("{raw:?} is not a number")),
+            },
+        },
+        ColumnKind::Money { currency } => match Decimal::from_str(raw) {
+            Ok(d) => Value::Money(d, currency.clone()),
+            Err(_) => match crate::money::parse_amount(raw) {
+                Ok((d, None)) => Value::Money(d, currency.clone()),
+                Ok((d, Some(c))) if &c == currency => Value::Money(d, c),
+                Ok((_, Some(c))) => Value::Error(format!("{raw:?} is in {c}, but this is a {currency} column")),
+                Err(_) => Value::Error(format!("{raw:?} is not an amount")),
+            },
+        },
         ColumnKind::Calc { .. } => Value::Empty,
     }
 }
@@ -230,7 +245,10 @@ fn sheet_currencies(columns: &[ColumnInfo], cols: &[formula::ColRef]) -> (Vec<Cu
     for c in columns {
         match &c.spec.kind {
             ColumnKind::Money { currency } => all.push(currency.clone()),
-            ColumnKind::Calc { formula: src } => {
+            ColumnKind::Calc { formula: src, currency } => {
+                if let Some(c) = currency {
+                    targets.push(c.clone());
+                }
                 if let Ok(e) = formula::parse(src).and_then(|e| formula::resolve(&e, cols)) {
                     walk(&e, &mut targets);
                 }
@@ -277,7 +295,7 @@ fn calc_order(columns: &[ColumnInfo], cols: &[formula::ColRef]) -> (Vec<(usize, 
     let mut parsed: Vec<(usize, Expr, Vec<usize>)> = Vec::new();
     let mut errors = HashMap::new();
     for (i, c) in columns.iter().enumerate() {
-        if let ColumnKind::Calc { formula: src } = &c.spec.kind {
+        if let ColumnKind::Calc { formula: src, .. } = &c.spec.kind {
             match formula::parse(src).and_then(|e| formula::resolve(&e, cols)) {
                 Ok(e) => {
                     let deps = formula::refs(&e).iter().filter_map(|id| columns.iter().position(|c| &c.col_id == id)).collect();
@@ -374,6 +392,7 @@ impl Project {
         sheet_id: &str,
         col_id: Option<&str>,
         source: &str,
+        currency: Option<Currency>,
         rates: &RateTable,
         today: NaiveDate,
     ) -> Result<Vec<String>> {
@@ -393,7 +412,7 @@ impl Project {
             spec: crate::ops::ColumnSpec {
                 name: "__preview".into(),
                 var: "__preview".into(),
-                kind: ColumnKind::Calc { formula: resolved.to_string() },
+                kind: ColumnKind::Calc { formula: resolved.to_string(), currency },
                 total: false,
             },
         };
@@ -497,6 +516,18 @@ impl Project {
                     let v = {
                         let ctx = RowCtx { functions: self.functions(), columns: &columns, values: &values, conv: &conv };
                         formula::eval(expr, &ctx)
+                    };
+                    // A calculated column with a currency gives amounts in it: other
+                        // currencies are converted at the rate card, plain numbers taken as it.
+                    let v = match (&columns[*i].spec.kind, v) {
+                        (ColumnKind::Calc { currency: Some(want), .. }, Value::Money(x, c)) if &c != want => {
+                            match conv.convert(x, &c, want) {
+                                Ok(y) => Value::Money(y, want.clone()),
+                                Err(e) => Value::Error(e),
+                            }
+                        }
+                        (ColumnKind::Calc { currency: Some(want), .. }, Value::Number(x)) => Value::Money(x, want.clone()),
+                        (_, other) => other,
                     };
                     let v = match v {
                         Value::Money(x, c) if per_line => Value::Money(round(x, &c, settings.rounding), c),
@@ -624,7 +655,7 @@ impl Project {
                     name: c.spec.name.clone(),
                     var: c.spec.var.clone(),
                     formula_display: match &c.spec.kind {
-                        ColumnKind::Calc { formula: src } => Some(
+                        ColumnKind::Calc { formula: src, .. } => Some(
                             formula::parse(src)
                                 .and_then(|e| formula::resolve(&e, &col_refs))
                                 .map(|e| formula::render(&e, &col_refs))
@@ -794,7 +825,7 @@ mod tests {
             position: 10.0,
             spec: crate::ops::ColumnSpec {
                 name: "EUR".into(),
-                kind: ColumnKind::Calc { formula: "to(total_usd, EUR)".into() },
+                kind: ColumnKind::Calc { formula: "to(total_usd, EUR)".into(), currency: None },
                 total: false,
                 var: String::new(),
             },
@@ -819,7 +850,7 @@ mod tests {
             sheet_id: "s".into(),
             col_id: "eur".into(),
             position: 10.0,
-            spec: crate::ops::ColumnSpec { name: "EUR".into(), var: String::new(), kind: ColumnKind::Calc { formula: "to(uah, EUR)".into() }, total: false },
+            spec: crate::ops::ColumnSpec { name: "EUR".into(), var: String::new(), kind: ColumnKind::Calc { formula: "to(uah, EUR)".into(), currency: None }, total: false },
         })
         .unwrap();
         add_row(&mut p, "a", &[("uah", "4400"), ("qty", "1")]);
@@ -887,16 +918,78 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut p = spending_project(tmp.path());
         add_row(&mut p, "a", &[("uah", "4400"), ("qty", "3")]);
-        let got = p.preview_formula("s", None, "total_usd * 2", &rates(), d("2026-10-22")).unwrap();
+        let got = p.preview_formula("s", None, "total_usd * 2", None, &rates(), d("2026-10-22")).unwrap();
         assert_eq!(got, ["row 1: 600.00 USD"]);
-        assert!(p.preview_formula("s", None, "nope * 2", &rates(), d("2026-10-22")).is_err());
-        assert!(p.preview_formula("s", Some("total"), "total_usd * 2", &rates(), d("2026-10-22")).is_err(), "itself");
+        assert!(p.preview_formula("s", None, "nope * 2", None, &rates(), d("2026-10-22")).is_err());
+        assert!(p.preview_formula("s", Some("total"), "total_usd * 2", None, &rates(), d("2026-10-22")).is_err(), "itself");
         // The spending template works out of the box.
         let id = "t".to_string();
         p.apply(Op::Batch { ops: crate::templates::sheet_ops("spending", &id, "Kit") }).unwrap();
         let cols = p.columns("t").unwrap();
         assert_eq!(cols.iter().map(|c| c.col_id.as_str()).collect::<Vec<_>>(), ["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8"]);
-        assert_eq!(cols[5].spec.kind, ColumnKind::Calc { formula: "coalesce(to(c4, USD), c5)".into() });
+        assert_eq!(cols[5].spec.kind, ColumnKind::Calc { formula: "coalesce(c4, c5)".into(), currency: Some(cur("USD")) });
+    }
+
+    #[test]
+    fn retyped_columns_read_amounts_with_currencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = spending_project(tmp.path());
+        // A text column holding pasted amounts, then turned into money.
+        p.apply(Op::AddColumn {
+            sheet_id: "s".into(),
+            col_id: "pasted".into(),
+            position: 0.5,
+            spec: crate::ops::ColumnSpec { name: "Pasted".into(), var: String::new(), kind: ColumnKind::Text, total: false },
+        })
+        .unwrap();
+        add_row(&mut p, "a", &[("pasted", "UAH 3,250.00")]);
+        add_row(&mut p, "b", &[("pasted", "$ 71.50")]);
+        p.apply(Op::UpdateColumn {
+            sheet_id: "s".into(),
+            col_id: "pasted".into(),
+            spec: crate::ops::ColumnSpec {
+                name: "Pasted".into(),
+                var: "pasted".into(),
+                kind: ColumnKind::Money { currency: cur("UAH") },
+                total: false,
+            },
+        })
+        .unwrap();
+        // Converted on the type change where it fits; kept as typed where it doesn't.
+        let cells = p.cells("s").unwrap();
+        assert_eq!(cells[&("a".into(), "pasted".into())], "3250");
+        assert_eq!(cells[&("b".into(), "pasted".into())], "$ 71.50");
+        let v = p.sheet_view("s", &rates(), d("2026-10-22")).unwrap();
+        assert!(cell(&v, 1, "pasted").error.as_deref().unwrap().contains("USD"));
+        // Undo puts the text back.
+        p.undo().unwrap();
+        assert_eq!(p.cells("s").unwrap()[&("a".into(), "pasted".into())], "UAH 3,250.00");
+        assert!(matches!(input_value(&ColumnKind::Money { currency: cur("UAH") }, Some(&"UAH 3,250.00".to_string())), Value::Money(_, _)));
+    }
+
+    #[test]
+    fn money_typed_calc_columns_convert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = spending_project(tmp.path());
+        // Unit price in USD with no to(): the column's currency converts the UAH price.
+        p.apply(Op::UpdateColumn {
+            sheet_id: "s".into(),
+            col_id: "unit".into(),
+            spec: crate::ops::ColumnSpec {
+                name: "Unit USD".into(),
+                var: "unit_usd".into(),
+                kind: ColumnKind::Calc { formula: "coalesce(uah, usd)".into(), currency: Some(cur("USD")) },
+                total: false,
+            },
+        })
+        .unwrap();
+        add_row(&mut p, "a", &[("uah", "4400"), ("qty", "2")]);
+        add_row(&mut p, "b", &[("usd", "250"), ("qty", "1")]);
+        let v = p.sheet_view("s", &rates(), d("2026-10-22")).unwrap();
+        assert_eq!(cell(&v, 0, "unit").value.as_deref(), Some("100.00"), "{:?} {:?}", cell(&v, 0, "unit"), v.warnings);
+        assert_eq!(cell(&v, 0, "unit").currency.as_ref().unwrap().code(), "USD");
+        assert_eq!(cell(&v, 1, "unit").value.as_deref(), Some("250.00"));
+        assert_eq!(v.totals[5].as_ref().unwrap().amount, "450.00");
     }
 
     #[test]

@@ -2,14 +2,20 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import type { ColumnSpec, ColumnView } from "./types";
 
-type Kind = ColumnSpec["type"];
+/** Where a column's values come from. */
+type Source = "typed" | "calc";
+/** What a column holds. Calculated columns are "any" (whatever the formula gives) or money/number. */
+type Type = "text" | "number" | "money" | "link" | "any";
 
-const KINDS: { kind: Kind; label: string }[] = [
-  { kind: "text", label: "Text" },
-  { kind: "number", label: "Number" },
-  { kind: "money", label: "Money" },
-  { kind: "calc", label: "Calculated" },
-  { kind: "link", label: "Link" },
+const TYPED: { t: Type; label: string }[] = [
+  { t: "text", label: "Text" },
+  { t: "number", label: "Number" },
+  { t: "money", label: "Money" },
+  { t: "link", label: "Link" },
+];
+const CALC: { t: Type; label: string }[] = [
+  { t: "money", label: "Money" },
+  { t: "any", label: "As the formula gives" },
 ];
 
 /** Examples written with this sheet's own column names where possible. */
@@ -19,9 +25,9 @@ function examples(cols: ColumnView[]): [string, string][] {
   const a = money[0] ?? "price_uah";
   const b = money[1] ?? "price_usd";
   return [
+    [`coalesce(${a}, ${b})`, `${a} if it's filled in, otherwise ${b}`],
     [`${a} * ${num}`, "multiply two columns on the same row"],
     [`to(${a}, USD)`, "convert to dollars at the sheet's rates"],
-    [`coalesce(${a}, ${b})`, `${a} if it's filled in, otherwise ${b}`],
     [`round(${a} * 1.2, 2)`, "round to 2 decimals"],
   ];
 }
@@ -42,6 +48,8 @@ export interface ColumnEditorProps {
   column: ColumnView | null;
   /** The sheet's other columns, offered for formulas. */
   others: ColumnView[];
+  /** The sheet's base currency: the default for calculated money columns. */
+  baseCurrency: string;
   at: { x: number; y: number };
   onSave: (spec: ColumnSpec) => void;
   onInsert?: (side: "left" | "right") => void;
@@ -49,32 +57,49 @@ export interface ColumnEditorProps {
   onClose: () => void;
 }
 
-export function ColumnEditor({ sheetId, column, others, at, onSave, onInsert, onDelete, onClose }: ColumnEditorProps) {
+function initial(column: ColumnView | null, base: string): { source: Source; type: Type; currency: string } {
+  if (!column) return { source: "typed", type: "text", currency: base };
+  if (column.type === "calc") {
+    const cur = (column as { currency?: string | null }).currency;
+    return { source: "calc", type: cur ? "money" : "any", currency: cur ?? base };
+  }
+  return { source: "typed", type: column.type, currency: column.type === "money" ? column.currency : base };
+}
+
+export function ColumnEditor({ sheetId, column, others, baseCurrency, at, onSave, onInsert, onDelete, onClose }: ColumnEditorProps) {
+  const init = initial(column, baseCurrency);
   const [name, setName] = useState(column?.name ?? "");
   // The variable name follows the display name until it is edited by hand.
   const [varName, setVarName] = useState(column?.var ?? "");
   const [varTouched, setVarTouched] = useState(!!column);
-  const [kind, setKind] = useState<Kind>(column?.type ?? "text");
-  const [currency, setCurrency] = useState(column?.type === "money" ? column.currency : "USD");
+  const [source, setSource] = useState<Source>(init.source);
+  const [type, setType] = useState<Type>(init.type);
+  const [currency, setCurrency] = useState(init.currency);
   const [formula, setFormula] = useState(column?.formula_display ?? (column?.type === "calc" ? column.formula : ""));
   const [total, setTotal] = useState(column?.total ?? false);
   const [preview, setPreview] = useState<{ ok: boolean; lines: string[] } | null>(null);
   const formulaRef = useRef<HTMLInputElement>(null);
 
+  const currencyOk = /^[A-Z]{3}$/.test(currency.trim());
+  // A name suggested from what the column holds, accepted with Tab or a click.
+  const suggestion =
+    type === "money" && currencyOk ? (source === "calc" ? `Total (${currency})` : `Price (${currency})`) : type === "number" ? "Qty" : "";
+
   useEffect(() => {
-    if (!varTouched) setVarName(varFromName(name));
+    if (!varTouched) setVarName(varFromName(name || ""));
   }, [name, varTouched]);
 
   // Try the formula as it is typed.
   useEffect(() => {
-    if (kind !== "calc" || !formula.trim()) {
+    if (source !== "calc" || !formula.trim()) {
       setPreview(null);
       return;
     }
     let live = true;
+    const cur = type === "money" && currencyOk ? currency : null;
     const t = setTimeout(() => {
       api
-        .previewFormula(sheetId, column?.col_id ?? null, formula)
+        .previewFormula(sheetId, column?.col_id ?? null, formula, cur)
         .then((lines) => live && setPreview({ ok: true, lines }))
         .catch((e) => live && setPreview({ ok: false, lines: [String(e).replace(/^invalid value: /, "")] }));
     }, 200);
@@ -82,7 +107,7 @@ export function ColumnEditor({ sheetId, column, others, at, onSave, onInsert, on
       live = false;
       clearTimeout(t);
     };
-  }, [kind, formula, sheetId, column?.col_id]);
+  }, [source, type, currency, currencyOk, formula, sheetId, column?.col_id]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -95,43 +120,55 @@ export function ColumnEditor({ sheetId, column, others, at, onSave, onInsert, on
     if (!el) return setFormula((f) => f + text);
     const start = el.selectionStart ?? formula.length;
     const end = el.selectionEnd ?? formula.length;
-    const next = formula.slice(0, start) + text + formula.slice(end);
-    setFormula(next);
+    setFormula(formula.slice(0, start) + text + formula.slice(end));
     requestAnimationFrame(() => {
       el.focus();
       el.setSelectionRange(start + text.length, start + text.length);
     });
   };
 
-  const currencyOk = /^[A-Za-z]{3}$/.test(currency.trim());
-  const varOk = VAR_OK.test(varName) && !/^[cr]\d+$/.test(varName);
+  const finalName = name.trim() || suggestion;
+  const finalVar = varTouched ? varName : finalName ? varFromName(finalName) : "";
+  const varOk = VAR_OK.test(finalVar) && !/^[cr]\d+$/.test(finalVar);
   const canSave =
-    name.trim() !== "" &&
+    finalName !== "" &&
     varOk &&
-    (kind !== "money" || currencyOk) &&
-    (kind !== "calc" || (formula.trim() !== "" && preview?.ok !== false));
+    (type !== "money" || currencyOk) &&
+    (source !== "calc" || (formula.trim() !== "" && preview?.ok !== false));
 
   const save = () => {
     if (!canSave) return;
-    const base = { name: name.trim(), var: varName, total };
-    const spec: ColumnSpec =
-      kind === "money"
-        ? { ...base, type: "money", currency: currency.trim().toUpperCase() }
-        : kind === "calc"
-          ? { ...base, type: "calc", formula: formula.trim() }
-          : { ...base, type: kind };
+    const base = { name: finalName, var: finalVar, total };
+    let spec: ColumnSpec;
+    if (source === "calc") {
+      spec = { ...base, type: "calc", formula: formula.trim(), ...(type === "money" ? { currency } : {}) } as ColumnSpec;
+    } else if (type === "money") {
+      spec = { ...base, type: "money", currency };
+    } else {
+      spec = { ...base, type: type as "text" | "number" | "link" };
+    }
     onSave(spec);
   };
 
-  const left = Math.max(8, Math.min(at.x, window.innerWidth - 420));
-  const top = Math.max(8, Math.min(at.y, window.innerHeight - 520));
+  const chooseSource = (s: Source) => {
+    setSource(s);
+    if (s === "calc") {
+      setType("money");
+      setTotal(true);
+    } else if (type === "any") {
+      setType("text");
+    }
+  };
+
+  const left = Math.max(8, Math.min(at.x, window.innerWidth - 430));
+  const top = Math.max(8, Math.min(at.y, window.innerHeight - 640));
 
   return (
     <>
       <div className="backdrop" onClick={onClose} />
       <form
         className="column-editor"
-        style={{ left, top }}
+        style={{ left, top, maxHeight: window.innerHeight - top - 8 }}
         onSubmit={(e) => {
           e.preventDefault();
           save();
@@ -142,60 +179,87 @@ export function ColumnEditor({ sheetId, column, others, at, onSave, onInsert, on
           <span className="ce-title">{column ? "Edit column" : "New column"}</span>
         </div>
 
+        <div className="ce-row">
+          <span className="ce-label">Values</span>
+          <div className="kinds">
+            <button type="button" className={source === "typed" ? "on" : ""} onClick={() => chooseSource("typed")}>
+              Typed in
+            </button>
+            <button type="button" className={source === "calc" ? "on" : ""} onClick={() => chooseSource("calc")}>
+              Calculated
+            </button>
+          </div>
+        </div>
+
+        <div className="ce-row">
+          <span className="ce-label">Type</span>
+          <div className="kinds">
+            {(source === "typed" ? TYPED : CALC).map((k) => (
+              <button type="button" key={k.t} className={k.t === type ? "on" : ""} onClick={() => setType(k.t)}>
+                {k.label}
+              </button>
+            ))}
+            {type === "money" && (
+              <input
+                value={currency}
+                onChange={(e) => setCurrency(e.target.value.toUpperCase())}
+                maxLength={3}
+                size={4}
+                className={currencyOk ? "currency" : "currency bad"}
+                title="Currency"
+              />
+            )}
+          </div>
+        </div>
+        {source === "calc" && type === "money" && (
+          <div className="muted small">Results are in {currencyOk ? currency : "this currency"}: amounts in other currencies are converted at the sheet's rates.</div>
+        )}
+
         <div className="ce-names-row">
           <label>
             Display name
-            <input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Price (UAH)" />
+            <input
+              autoFocus
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={suggestion || "Column name"}
+              onKeyDown={(e) => {
+                if (e.key === "Tab" && !e.shiftKey && !name && suggestion) {
+                  e.preventDefault();
+                  setName(suggestion);
+                }
+              }}
+            />
           </label>
           <label>
             Variable name
             <input
-              value={varName}
+              value={varTouched ? varName : finalVar}
               onChange={(e) => {
                 setVarTouched(true);
                 setVarName(e.target.value);
               }}
-              placeholder="price_uah"
               className={varOk ? "mono" : "mono bad"}
               spellCheck={false}
             />
           </label>
         </div>
+        {!name && suggestion && (
+          <div className="small">
+            <button type="button" className="suggest" onClick={() => setName(suggestion)}>
+              Use “{suggestion}”
+            </button>{" "}
+            <span className="muted">or press Tab</span>
+          </div>
+        )}
 
-        <div className="kinds">
-          {KINDS.map((k) => (
-            <button
-              type="button"
-              key={k.kind}
-              className={k.kind === kind ? "on" : ""}
-              onClick={() => {
-                setKind(k.kind);
-                if (k.kind === "calc") setTotal(true);
-              }}
-            >
-              {k.label}
-            </button>
-          ))}
-          {kind === "money" && (
-            <input
-              value={currency}
-              onChange={(e) => setCurrency(e.target.value.toUpperCase())}
-              maxLength={3}
-              size={4}
-              className={currencyOk ? "currency" : "currency bad"}
-              placeholder="UAH"
-              title="Currency"
-            />
-          )}
-        </div>
-
-        {kind === "calc" && (
+        {source === "calc" && (
           <>
             <input
               ref={formulaRef}
               value={formula}
               onChange={(e) => setFormula(e.target.value)}
-              placeholder="unit_usd * qty"
+              placeholder="Formula, e.g. coalesce(price_uah, price_usd)"
               className={preview?.ok === false ? "mono formula bad" : "mono formula"}
               spellCheck={false}
             />
@@ -208,8 +272,7 @@ export function ColumnEditor({ sheetId, column, others, at, onSave, onInsert, on
             <div className="ce-cols">
               {others.map((c) => (
                 <button type="button" key={c.col_id} onClick={() => insert(c.var)} title={`Insert ${c.var}`}>
-                  <span className="ce-id">{c.col_id}</span> <span className="mono">{c.var}</span>{" "}
-                  <span className="muted">{c.name}</span>
+                  <span className="ce-id">{c.col_id}</span> <span className="mono">{c.var}</span> <span className="muted">{c.name}</span>
                 </button>
               ))}
             </div>
@@ -229,7 +292,7 @@ export function ColumnEditor({ sheetId, column, others, at, onSave, onInsert, on
 
         <label className="check">
           <input type="checkbox" checked={total} onChange={(e) => setTotal(e.target.checked)} />
-          Add up (section subtotals and sheet total)
+          Show total (in the Total row and on section headings)
         </label>
 
         <div className="ce-actions">

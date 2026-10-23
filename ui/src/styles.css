@@ -123,6 +123,11 @@ input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accen
 .tabs .hint { margin-left: auto; align-self: center; color: var(--muted); font-size: 11px; white-space: nowrap; padding-left: 16px; }
 
 .toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  user-select: text;
+  -webkit-user-select: text;
   position: fixed;
   right: 16px;
   bottom: 44px;
@@ -132,8 +137,9 @@ input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accen
   background: var(--text);
   color: var(--bg);
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
-  cursor: pointer;
 }
+.toast-text { flex: 1; user-select: text; -webkit-user-select: text; cursor: text; }
+.toast-btn { background: transparent; color: inherit; border: 1px solid currentColor; opacity: 0.8; padding: 1px 7px; font-size: 12px; }
 .toast.error { background: var(--error); color: #fff; }
 
 /* ---- columns, sections, menus ---- */
@@ -259,3 +265,13 @@ button.danger { color: var(--error); }
 .fn-try { display: flex; align-items: center; gap: 8px; }
 .fn-try .ok { color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .rate-card-btn { font-variant-numeric: tabular-nums; }
+
+.totals .detail, .totals .warning, .ce-error, .ce-preview { user-select: text; -webkit-user-select: text; cursor: text; }
+.warnings { display: flex; flex-direction: column; align-items: flex-start; }
+.copy-link { border: none; background: none; padding: 0; color: var(--accent); font-size: 12px; }
+.ce-row { display: flex; align-items: center; gap: 10px; }
+.ce-label { width: 48px; color: var(--muted); font-size: 12px; }
+button.suggest { padding: 2px 8px; font-size: 12px; }
+.column-editor { max-height: calc(100vh - 16px); overflow-y: auto; }
+.toast-btn { flex-shrink: 0; }
+.toast { max-width: 520px; }

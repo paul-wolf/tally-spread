@@ -9,7 +9,7 @@ export type ColumnKind =
   | { type: "link" }
   | { type: "number" }
   | { type: "money"; currency: string }
-  | { type: "calc"; formula: string };
+  | { type: "calc"; formula: string; currency?: string | null };
 
 /** name = display name ("Price (UAH)"); var = variable name ("price_uah"; empty = derive). */
 export type ColumnSpec = { name: string; var: string; total: boolean } & ColumnKind;

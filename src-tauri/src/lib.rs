@@ -348,9 +348,16 @@ fn create_sheet(state: State<AppState>, name: String, template: String) -> CmdRe
 
 /// Try a column formula as it is typed: its result on the first rows, or the problem.
 #[tauri::command]
-fn preview_formula(state: State<AppState>, sheet_id: String, col_id: Option<String>, formula: String) -> CmdResult<Vec<String>> {
+fn preview_formula(
+    state: State<AppState>,
+    sheet_id: String,
+    col_id: Option<String>,
+    formula: String,
+    currency: Option<String>,
+) -> CmdResult<Vec<String>> {
     let inner = state.0.lock().map_err(err)?;
-    inner.project.preview_formula(&sheet_id, col_id.as_deref(), &formula, &inner.rates, today()).map_err(err)
+    let currency = currency.map(|c| Currency::new(&c)).transpose().map_err(err)?;
+    inner.project.preview_formula(&sheet_id, col_id.as_deref(), &formula, currency, &inner.rates, today()).map_err(err)
 }
 
 /// Save a user function (shared by every sheet and project); `old_name` renames one.

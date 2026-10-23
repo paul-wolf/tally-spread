@@ -11,8 +11,8 @@ export const api = {
   openProject: (dirName: string) => invoke<Snapshot>("open_project", { dirName }),
   createProject: (name: string) => invoke<Snapshot>("create_project", { name }),
   createSheet: (name: string, template: "blank" | "spending") => invoke<Snapshot>("create_sheet", { name, template }),
-  previewFormula: (sheetId: string, colId: string | null, formula: string) =>
-    invoke<string[]>("preview_formula", { sheetId, colId, formula }),
+  previewFormula: (sheetId: string, colId: string | null, formula: string, currency: string | null) =>
+    invoke<string[]>("preview_formula", { sheetId, colId, formula, currency }),
   saveSettings: (settings: ProjectSettings, sheetId: string | null) =>
     invoke<Snapshot>("save_settings", { settings, sheetId }),
   refreshRates: () => invoke<RefreshReport[]>("refresh_rates"),

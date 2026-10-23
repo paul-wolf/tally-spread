@@ -461,10 +461,38 @@ impl Project {
                 let old = self.column(sheet_id, col_id)?;
                 let spec = self.check_spec(sheet_id, col_id, spec)?;
                 self.write_spec(sheet_id, col_id, &spec)?;
-                Ok((
-                    Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), spec },
-                    Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), spec: old.spec },
-                ))
+                let update = Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), spec: spec.clone() };
+                let restore = Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), spec: old.spec.clone() };
+                if old.spec.kind == spec.kind || !spec.kind.is_input() {
+                    return Ok((update, restore));
+                }
+                // The type changed: convert values that fit the new type ("UAH 3,250.00"
+                // -> 3250 in a UAH column); leave the rest as typed, shown as problems.
+                let mut done = vec![update];
+                let mut undo = vec![restore];
+                let items: Vec<String> =
+                    self.rows(sheet_id)?.into_iter().filter(|r| r.kind == RowKind::Item).map(|r| r.row_id).collect();
+                for row_id in items {
+                    let Some(raw) = self.cell(sheet_id, &row_id, col_id)? else { continue };
+                    let Ok(norm) = normalize_cell(&spec, &raw) else { continue };
+                    if norm == raw {
+                        continue;
+                    }
+                    let (set, unset) = self.exec(&Op::SetCell {
+                        sheet_id: sheet_id.clone(),
+                        row_id,
+                        col_id: col_id.clone(),
+                        value: Some(norm),
+                    })?;
+                    done.push(set);
+                    undo.push(unset);
+                }
+                // Undo restores the old type first, so the old text goes back unconverted.
+                if done.len() == 1 {
+                    Ok((done.pop().unwrap(), undo.pop().unwrap()))
+                } else {
+                    Ok((Op::Batch { ops: done }, Op::Batch { ops: undo }))
+                }
             }
             Op::MoveColumn { sheet_id, col_id, position } => {
                 finite(*position)?;
@@ -627,7 +655,7 @@ impl Project {
             v
         };
         let kind = match &spec.kind {
-            ColumnKind::Calc { formula: src } => {
+            ColumnKind::Calc { formula: src, currency } => {
                 let expr = formula::parse(src).map_err(|e| Error::InvalidValue(format!("formula: {e}")))?;
                 let mut cols = self.col_refs(sheet_id)?;
                 cols.retain(|c| c.id != col_id);
@@ -636,7 +664,7 @@ impl Project {
                 if formula::refs(&resolved).iter().any(|r| r == col_id) {
                     return Err(Error::InvalidValue(format!("the formula for {name} refers to itself")));
                 }
-                ColumnKind::Calc { formula: resolved.to_string() }
+                ColumnKind::Calc { formula: resolved.to_string(), currency: currency.clone() }
             }
             other => other.clone(),
         };
@@ -699,11 +727,11 @@ impl Project {
                 ids.get(&(sheet.to_string(), col.to_string())).cloned().unwrap_or_else(|| col.to_string())
             };
             let legacy_spec = |p: &Project, sheet: &str, mut spec: ColumnSpec| -> Result<ColumnSpec> {
-                if let ColumnKind::Calc { formula: src } = &spec.kind {
+                if let ColumnKind::Calc { formula: src, currency } = &spec.kind {
                     let cols = p.col_refs(sheet)?;
                     let expr = formula::parse(src).map_err(Error::InvalidValue)?;
                     let resolved = formula::resolve_legacy(&expr, &cols).map_err(Error::InvalidValue)?;
-                    spec.kind = ColumnKind::Calc { formula: resolved.to_string() };
+                    spec.kind = ColumnKind::Calc { formula: resolved.to_string(), currency: currency.clone() };
                 }
                 Ok(spec)
             };
@@ -1007,9 +1035,9 @@ pub(crate) mod tests {
             ("item", spec("Item", K::Text, false)),
             ("uah", spec("UAH", K::Money { currency: cur("UAH") }, false)),
             ("usd", spec("USD", K::Money { currency: cur("USD") }, false)),
-            ("unit", spec("Unit USD", K::Calc { formula: "coalesce(to(uah, USD), usd)".into() }, false)),
+            ("unit", spec("Unit USD", K::Calc { formula: "coalesce(to(uah, USD), usd)".into(), currency: None }, false)),
             ("qty", spec("Qty", K::Number, false)),
-            ("total", spec("Total USD", K::Calc { formula: "[Unit USD] * qty".into() }, true)),
+            ("total", spec("Total USD", K::Calc { formula: "[Unit USD] * qty".into(), currency: None }, true)),
         ];
         let mut ops = vec![Op::CreateSheet { sheet_id: "s".into(), name: "Drone".into() }];
         for (i, (id, s)) in cols.into_iter().enumerate() {
@@ -1076,14 +1104,14 @@ pub(crate) mod tests {
             .is_err());
 
         // Formulas are stored by ID, so renaming Unit USD changes nothing in Total USD.
-        assert_eq!(p.column("s", "total").unwrap().spec.kind, K::Calc { formula: "unit * qty".into() });
+        assert_eq!(p.column("s", "total").unwrap().spec.kind, K::Calc { formula: "unit * qty".into(), currency: None });
         p.apply(Op::UpdateColumn {
             sheet_id: "s".into(),
             col_id: "unit".into(),
-            spec: ColumnSpec { name: "Each (USD)".into(), var: "each_usd".into(), kind: K::Calc { formula: "coalesce(to(uah, USD), usd)".into() }, total: false },
+            spec: ColumnSpec { name: "Each (USD)".into(), var: "each_usd".into(), kind: K::Calc { formula: "coalesce(to(uah, USD), usd)".into(), currency: None }, total: false },
         })
         .unwrap();
-        assert_eq!(p.column("s", "total").unwrap().spec.kind, K::Calc { formula: "unit * qty".into() });
+        assert_eq!(p.column("s", "total").unwrap().spec.kind, K::Calc { formula: "unit * qty".into(), currency: None });
         assert_eq!(p.column("s", "unit").unwrap().spec.var, "each_usd");
 
         // Delete and restore a column.
@@ -1101,13 +1129,13 @@ pub(crate) mod tests {
             sheet_id: "s".into(),
             col_id: "x".into(),
             position: 99.0,
-            spec: spec("X", K::Calc { formula: f.into() }, false),
+            spec: spec("X", K::Calc { formula: f.into(), currency: None }, false),
         };
         assert!(p.apply(add("qty *")).is_err());
         assert!(p.apply(add("x + 1")).is_err(), "refers to itself");
         assert!(p.apply(add("price * 2")).is_err(), "no such column");
         assert!(p.apply(add("= Qty * 2")).is_ok());
-        assert_eq!(p.column("s", "x").unwrap().spec.kind, K::Calc { formula: "qty * 2".into() });
+        assert_eq!(p.column("s", "x").unwrap().spec.kind, K::Calc { formula: "qty * 2".into(), currency: None });
     }
 
     #[test]
@@ -1199,8 +1227,8 @@ pub(crate) mod tests {
         let cols = p.columns("s").unwrap();
         let ids: Vec<_> = cols.iter().map(|c| (c.col_id.as_str(), c.spec.var.as_str())).collect();
         assert_eq!(ids, [("c1", "item"), ("c2", "uah"), ("c3", "usd"), ("c4", "unit_usd"), ("c5", "qty"), ("c6", "total_usd")]);
-        assert_eq!(cols[3].spec.kind, K::Calc { formula: "coalesce(to(c2, USD), c3)".into() });
-        assert_eq!(cols[5].spec.kind, K::Calc { formula: "c4 * c5".into() });
+        assert_eq!(cols[3].spec.kind, K::Calc { formula: "coalesce(to(c2, USD), c3)".into(), currency: None });
+        assert_eq!(cols[5].spec.kind, K::Calc { formula: "c4 * c5".into(), currency: None });
         assert_eq!(p.cells("s").unwrap()[&("r1".into(), "c2".into())], "4400");
         assert_eq!(read_settings(tmp.path()).unwrap().format, FORMAT);
         assert!(tmp.path().join("ops-v2-backup/mac.jsonl").exists());

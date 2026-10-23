@@ -272,12 +272,33 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
     [view, widths, dark],
   );
 
+  // The last row is the pinned Total row.
+  const totalRow = view.rows.length + BLANK_ROWS;
+
   const getCellContent = useCallback(
     ([col, row]: Item): GridCell => {
       const c = view.columns[col];
       const r = view.rows[row];
       const empty: GridCell = { kind: GridCellKind.Text, data: "", displayData: "", allowOverlay: false, readonly: true };
       if (!c) return empty;
+      if (row === totalRow) {
+        // The Total row, pinned to the bottom: sheet totals under each column.
+        const t = view.totals[col];
+        if (t) {
+          return {
+            kind: GridCellKind.Text,
+            data: t.amount,
+            displayData: t.complete ? group(t.amount) : `${group(t.amount)} ⚠`,
+            allowOverlay: false,
+            readonly: true,
+            contentAlign: "right",
+            themeOverride: { baseFontStyle: "700 13px", ...(t.complete ? {} : { textDark: "#b25c00" }) },
+          };
+        }
+        return col === 0
+          ? { kind: GridCellKind.Text, data: "Total", displayData: "Total", allowOverlay: false, readonly: true, themeOverride: { baseFontStyle: "700 13px" } }
+          : empty;
+      }
       if (!r) {
         // A blank row below the data: editable, becomes a real row when typed into.
         return isInput(c) ? { kind: GridCellKind.Text, data: "", displayData: "", allowOverlay: true } : empty;
@@ -328,13 +349,15 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
         themeOverride: cell.error ? { textDark: "#d9534f" } : { textDark: dark ? "#c8c8c8" : "#333" },
       };
     },
-    [view, dark],
+    [view, dark, totalRow],
   );
 
   const getRowThemeOverride = useCallback(
     (row: number) =>
-      view.rows[row]?.kind === "section" ? { bgCell: dark ? "#26262a" : "#f1f1ec", bgCellMedium: dark ? "#26262a" : "#f1f1ec" } : undefined,
-    [view, dark],
+      row === totalRow
+        ? { bgCell: dark ? "#2a2a2e" : "#ecece6", bgCellMedium: dark ? "#2a2a2e" : "#ecece6" }
+        : view.rows[row]?.kind === "section" ? { bgCell: dark ? "#26262a" : "#f1f1ec", bgCellMedium: dark ? "#26262a" : "#f1f1ec" } : undefined,
+    [view, dark, totalRow],
   );
 
   const onCellsEdited = useCallback(
@@ -346,6 +369,7 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
       let nextPos = Math.max(0, ...v.rows.map((r) => r.position)) + 1;
       const sorted = [...edits].sort((a, b) => a.location[1] - b.location[1]);
       for (const { location, value } of sorted) {
+        if (location[1] >= v.rows.length + BLANK_ROWS) continue; // the Total row
         const col = v.columns[location[0]];
         if (!col || !isInput(col)) continue;
         const data = "data" in value && typeof value.data === "string" ? value.data : "";
@@ -447,7 +471,8 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
   return (
     <DataEditor
       columns={columns}
-      rows={view.rows.length + BLANK_ROWS}
+      rows={view.rows.length + BLANK_ROWS + 1}
+      freezeTrailingRows={1}
       getCellContent={getCellContent}
       getCellsForSelection={true}
       getRowThemeOverride={getRowThemeOverride}

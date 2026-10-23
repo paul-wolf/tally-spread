@@ -346,6 +346,18 @@ fn create_sheet(state: State<AppState>, name: String, template: String) -> CmdRe
     inner.snapshot(Some(&id), vec![])
 }
 
+/// Add a CSV or JSON file as a new sheet; its columns are typed from the values.
+#[tauri::command]
+fn import_file(state: State<AppState>, path: String) -> CmdResult<Snapshot> {
+    let p = Path::new(&path);
+    let table = tally_core::import::read_file(p).map_err(err)?;
+    let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("Imported").to_string();
+    let mut inner = state.0.lock().map_err(err)?;
+    let id = Op::new_id();
+    inner.project.apply(Op::Batch { ops: tally_core::import::sheet_ops(&table, &id, &name) }).map_err(err)?;
+    inner.snapshot(Some(&id), vec![])
+}
+
 /// Try a column formula as it is typed: its result on the first rows, or the problem.
 #[tauri::command]
 fn preview_formula(
@@ -446,7 +458,8 @@ pub fn run() {
             delete_function,
             try_function,
             export_xlsx,
-            export_sheet
+            export_sheet,
+            import_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tally");

@@ -373,6 +373,23 @@ export default function App() {
         onApply={apply}
         onAdd={async (template) => {
           setSelection(emptySelection);
+          if (template === "file") {
+            const path = await openDialog({
+              multiple: false,
+              filters: [{ name: "CSV or JSON", extensions: ["csv", "tsv", "txt", "json"] }],
+            });
+            if (typeof path !== "string") return;
+            setMessage({ text: `Importing ${path.split(/[\\/]/).pop()}…` });
+            try {
+              const s = await api.importFile(path);
+              show(s);
+              const v = s.sheet;
+              if (v) setMessage({ text: `Imported ${v.rows.length} rows and ${v.columns.length} columns into “${v.name}”. Double-click a header to rename or retype a column.` });
+            } catch (e) {
+              fail(e);
+            }
+            return;
+          }
           await run(api.createSheet(template === "spending" ? "Spending" : `Sheet ${snap.sheets.length + 1}`, template));
         }}
       />
@@ -680,7 +697,7 @@ function SheetTabs(props: {
   current: string | null;
   onSelect: (id: string) => void;
   onApply: (op: Op) => void;
-  onAdd: (template: "blank" | "spending") => void;
+  onAdd: (template: "blank" | "spending" | "file") => void;
 }) {
   const [renaming, setRenaming] = useState<string | null>(null);
   const [name, setName] = useState("");
@@ -765,6 +782,15 @@ function SheetTabs(props: {
             >
               Spending list
               <small>Item, Link, Note, UAH, USD, Unit USD, Qty, Total USD</small>
+            </button>
+            <button
+              onClick={() => {
+                setAdding(null);
+                props.onAdd("file");
+              }}
+            >
+              From a file…
+              <small>CSV or JSON; its headings become typed columns</small>
             </button>
           </div>
           </>

@@ -218,6 +218,21 @@ const ICON: Record<ColumnView["type"], GridColumnIcon> = {
   calc: GridColumnIcon.HeaderMath,
 };
 
+/** A width that fits the heading and the longest of the first values (≈7.3px a character). */
+function contentWidth(view: SheetView, j: number): number | null {
+  const c = view.columns[j];
+  let longest = 0;
+  for (const r of view.rows.slice(0, 200)) {
+    const cell = r.cells[j];
+    const v = cell?.raw ?? cell?.value ?? "";
+    const n = c.type === "number" || c.type === "money" || c.type === "calc" ? v.length + Math.floor(v.length / 4) + 1 : v.length;
+    if (n > longest) longest = n;
+  }
+  if (longest === 0) return null;
+  const head = c.name.length + 4; // room for the type icon
+  return Math.round(Math.min(360, Math.max(56, Math.max(longest, head) * 7.3 + 22)));
+}
+
 function defaultWidth(c: ColumnView, index: number): number {
   if (index === 0 && c.type === "text") return 260;
   switch (c.type) {
@@ -264,7 +279,7 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
         id: c.col_id,
         title: c.name,
         group: c.var ? `${c.col_id} · ${c.var}` : c.col_id,
-        width: widths[c.col_id] ?? defaultWidth(c, i),
+        width: widths[`${view.sheet_id}/${c.col_id}`] ?? contentWidth(view, i) ?? defaultWidth(c, i),
         icon: ICON[c.type],
         hasMenu: true,
         themeOverride: c.type === "calc" ? { bgHeader: dark ? "#26262c" : "#eef1f7" } : undefined,
@@ -474,7 +489,7 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
 
   const onColumnResize = useCallback((column: GridColumn, size: number) => {
     setWidths((w) => {
-      const next = { ...w, [column.id!]: size };
+      const next = { ...w, [`${viewRef.current.sheet_id}/${column.id}`]: size }; // per sheet: IDs repeat across sheets
       try {
         localStorage.setItem("tally.widths", JSON.stringify(next));
       } catch {

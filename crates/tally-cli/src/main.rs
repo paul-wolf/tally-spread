@@ -25,6 +25,8 @@ USAGE:
   tally projects                     list projects
   tally show <project> [sheet]       print a cost list with totals
   tally sql <project> <query>        run SQL against a project; each sheet is a table named after it
+  tally import <project> <file.csv|json>
+                                     add a file as a new sheet (columns typed from the values)
   tally export <project> <file> [sheet]
                                      export a sheet: .xlsx, .pdf, .csv or .json
   tally home                         print the Tally folder and this machine's id
@@ -44,6 +46,7 @@ fn main() -> ExitCode {
         ["show", project] => show(project, None),
         ["show", project, sheet] => show(project, Some(sheet)),
         ["sql", project, query] => sql(project, query),
+        ["import", project, file] => import(project, file),
         ["export", project, file] => export(project, file, None),
         ["export", project, file, sheet] => export(project, file, Some(sheet)),
         ["home"] => {
@@ -195,6 +198,18 @@ fn sheet_view(project: &str, sheet: Option<&str>) -> Result<tally_core::sheet::S
     };
     let rates = library()?.rates().map_err(e)?;
     p.sheet_view(&chosen.sheet_id, &rates, today()).map_err(e)
+}
+
+fn import(project: &str, file: &str) -> Res {
+    let path = std::path::Path::new(file);
+    let table = tally_core::import::read_file(path).map_err(e)?;
+    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Imported").to_string();
+    let mut p = open(project)?;
+    let id = tally_core::Op::new_id();
+    let started = std::time::Instant::now();
+    p.apply(tally_core::Op::Batch { ops: tally_core::import::sheet_ops(&table, &id, &name) }).map_err(e)?;
+    println!("imported {} rows × {} columns as sheet {name:?} in {:.1?}", table.rows.len(), table.headings.len(), started.elapsed());
+    Ok(())
 }
 
 fn export(project: &str, file: &str, sheet: Option<&str>) -> Res {

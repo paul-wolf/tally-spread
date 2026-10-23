@@ -29,7 +29,7 @@ use ulid::Ulid;
 use crate::formula;
 use crate::fx::RateSource;
 use crate::money::{parse_amount, Currency, Rounding, RoundingScope};
-use crate::ops::{ColumnKind, ColumnSpec, FixedRate, LogEntry, Op, RateMode, RowKind};
+use crate::ops::{ColumnKind, ColumnSpec, FixedRate, LogEntry, NewRow, Op, RateMode, RowKind};
 use crate::{Error, Result};
 
 /// Version of the project format. Projects made by an older version cannot be opened.
@@ -589,6 +589,58 @@ impl Project {
                     value: v,
                 };
                 Ok((make(normalized), make(old)))
+            }
+            Op::InsertRows { sheet_id, rows } => {
+                self.sheet(sheet_id)?;
+                let columns: HashMap<String, ColumnSpec> =
+                    self.columns(sheet_id)?.into_iter().map(|c| (c.col_id, c.spec)).collect();
+                let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+                {
+                    let mut st = self.conn.prepare("SELECT row_id FROM sheet_rows WHERE sheet_id = ?")?;
+                    let ids = st.query_map(params![sheet_id], |r| r.get::<_, String>(0))?;
+                    for id in ids {
+                        existing.insert(id?);
+                    }
+                }
+                // Check and normalise everything before writing anything.
+                let mut clean: Vec<NewRow> = Vec::with_capacity(rows.len());
+                for (n, r) in rows.iter().enumerate() {
+                    finite(r.position)?;
+                    if !existing.insert(r.row_id.clone()) {
+                        return Err(Error::InvalidValue(format!("row {} already exists", r.row_id)));
+                    }
+                    let mut cells = std::collections::BTreeMap::new();
+                    for (col_id, v) in &r.cells {
+                        let spec = columns.get(col_id).ok_or_else(|| Error::NotFound(format!("column {col_id}")))?;
+                        let v = v.trim();
+                        if v.is_empty() {
+                            continue;
+                        }
+                        let norm = normalize_cell(spec, v)
+                            .map_err(|e| Error::InvalidValue(format!("row {}, {}: {e}", n + 1, spec.name)))?;
+                        cells.insert(col_id.clone(), norm);
+                    }
+                    clean.push(NewRow { row_id: r.row_id.clone(), position: r.position, cells });
+                }
+                {
+                    let mut app = self.conn.appender("sheet_rows")?;
+                    for r in &clean {
+                        app.append_row(params![sheet_id, r.row_id, r.position, "item", false])?;
+                    }
+                }
+                {
+                    let mut app = self.conn.appender("cells")?;
+                    for r in &clean {
+                        for (col_id, v) in &r.cells {
+                            app.append_row(params![sheet_id, r.row_id, col_id, v])?;
+                        }
+                    }
+                }
+                let undo = clean
+                    .iter()
+                    .map(|r| Op::SetRowDeleted { sheet_id: sheet_id.clone(), row_id: r.row_id.clone(), deleted: true })
+                    .collect();
+                Ok((Op::InsertRows { sheet_id: sheet_id.clone(), rows: clean }, Op::Batch { ops: undo }))
             }
             Op::Batch { ops } => {
                 let mut done = Vec::with_capacity(ops.len());
@@ -1244,5 +1296,28 @@ pub(crate) mod tests {
         assert_eq!(normalize_url("http://x.com"), "http://x.com");
         assert_eq!(normalize_url("ask Olena"), "ask Olena");
         let _ = dec!(1);
+    }
+
+    #[test]
+    fn imported_rows_replay_and_undo() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let mut p = Project::create(tmp.path(), ProjectSettings::new("t", Currency::new("GBP").unwrap()), "mac").unwrap();
+            let t = crate::import::read_csv("name,price,qty\nA,₴1 200,2\nB,,3\n").unwrap();
+            p.apply(Op::Batch { ops: crate::import::sheet_ops(&t, "s", "Imported") }).unwrap();
+            assert_eq!(p.rows("s").unwrap().len(), 2);
+            assert_eq!(p.cells("s").unwrap().len(), 5);
+        }
+        let mut p = Project::open(tmp.path(), "mac").unwrap();
+        assert!(p.replay_warnings().is_empty(), "{:?}", p.replay_warnings());
+        assert_eq!(p.rows("s").unwrap().len(), 2);
+        let c = p.columns("s").unwrap();
+        assert_eq!(c[1].spec.kind, ColumnKind::Money { currency: Currency::new("UAH").unwrap() });
+        assert!(p.cells("s").unwrap().values().any(|v| v == "1200"));
+        let t = crate::import::read_csv("x\n1\n2\n").unwrap();
+        p.apply(Op::Batch { ops: crate::import::sheet_ops(&t, "s2", "Two") }).unwrap();
+        assert_eq!(p.rows("s2").unwrap().len(), 2);
+        assert!(p.undo().unwrap());
+        assert!(p.sheet("s2").is_err() || p.rows("s2").unwrap().is_empty());
     }
 }

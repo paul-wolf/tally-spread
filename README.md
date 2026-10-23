@@ -24,7 +24,7 @@ Status: early but usable. Sheets with your own columns, calculated columns, sect
 - **Your own functions.** Define `vat(x) = x * 0.2` or `usd(x) = to(x, USD)` once (ƒ Functions) and use them in any formula in every sheet and project; they live in the shared library and sync between machines. Functions can use their parameters, numbers, currencies, built-ins and each other (loops are refused).
 - **Exact money**: decimal arithmetic, per-currency rounding; amounts typed as `₴12 499,50`, `$ 71.50`, `1,234.56` or `12.50 EUR`.
 - **Typing and pasting like a spreadsheet.** Blank rows are always there to type into. Paste from Excel or Google Sheets anywhere (a heading row is skipped; values that don't fit a column are left out and reported). Copy, cut, transposed copy and paste, fill down, undo/redo of everything.
-- **Sheets as tabs** (blank, or a spending-list template); **projects** as folders.
+- **Sheets as tabs** (blank, a spending-list template, or **from a file**: a CSV or JSON file becomes a sheet whose columns are named after its headings and typed from its values: numbers, money in one currency, links, text); **projects** as folders.
 - **Export** to XLSX (real `=SUM()` subtotals and totals, clickable links, the rates used), PDF (laid out like the sheet, with section subtotals, totals and rates), and CSV or JSON for other tools (one line per item, its section as a field).
 - **Bold columns**: tick Bold in the column dialog; it carries into XLSX and PDF.
 - **Two machines**: logs are per machine, so a synced folder (Syncthing) never has two writers per file; the app picks up the other machine's changes every few seconds.
@@ -72,6 +72,7 @@ tally rates update                      # HMRC monthly, NBU, ECB into ~/Tally/li
 tally rates status
 tally convert 12499.50 UAH GBP
 tally show my-project
+tally import my-project flight-log.csv          # a file as a new sheet
 tally sql my-project "SELECT section, sum(total_usd) FROM spending GROUP BY 1"   # each sheet is a table
 ```
 

@@ -176,8 +176,21 @@ pub enum Op {
     /// `None` clears the cell. Amounts are stored normalised (`1200.5`, not `1 200,50`).
     SetCell { sheet_id: String, row_id: String, col_id: String, value: Option<String> },
 
+    /// Many new rows with their values at once (imports, big pastes): one log
+    /// line and one bulk insert instead of an operation per cell.
+    InsertRows { sheet_id: String, rows: Vec<NewRow> },
+
     /// Several operations applied, logged and undone as one.
     Batch { ops: Vec<Op> },
+}
+
+/// A row for [`Op::InsertRows`]: values by column ID (empty cells left out).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NewRow {
+    pub row_id: String,
+    pub position: f64,
+    #[serde(default)]
+    pub cells: std::collections::BTreeMap<String, String>,
 }
 
 impl Op {

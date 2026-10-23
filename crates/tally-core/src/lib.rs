@@ -9,6 +9,7 @@ pub mod error;
 pub mod export;
 pub mod formats;
 pub mod formula;
+pub mod import;
 pub mod fx;
 pub mod home;
 pub mod library;

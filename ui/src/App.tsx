@@ -325,6 +325,19 @@ export default function App() {
         onRedo={() => run(api.redo(sheetRef.current))}
         onInsertRow={insertRowAbove}
         onToggleSection={toggleSection}
+        onAddColumn={(at) => {
+          const v = snapRef.current?.sheet;
+          if (!v) return;
+          // Right of the selected column, or at the end.
+          const sel = selectionRef.current;
+          const x = sel.columns.length ? sel.columns.last()! : sel.current?.cell[0];
+          const cols = v.columns;
+          const position =
+            x !== undefined && cols[x]
+              ? positionBetween(cols[x].position, cols[x + 1]?.position)
+              : positionBetween(cols[cols.length - 1]?.position, undefined);
+          setEditing({ mode: "new", position, at: { x: at.x, y: at.y + at.height + 4 } });
+        }}
       />
 
       <main className="grid-area">
@@ -434,6 +447,7 @@ function TopBar(props: {
   onRedo: () => void;
   onInsertRow: () => void;
   onToggleSection: () => void;
+  onAddColumn: (at: Rectangle) => void;
 }) {
   const { snap } = props;
   const view = snap.sheet;
@@ -480,6 +494,15 @@ function TopBar(props: {
         </button>
         <button onClick={props.onToggleSection} title="Make the selected row a section heading, or back (⇧⌘S)">
           Section
+        </button>
+        <button
+          onClick={(e) => {
+            const r = e.currentTarget.getBoundingClientRect();
+            props.onAddColumn({ x: r.left, y: r.top, width: r.width, height: r.height });
+          }}
+          title="Add a column right of the selected one (or at the end). To edit a column, double-click its header."
+        >
+          + Column
         </button>
       </div>
 
@@ -614,7 +637,9 @@ function Totals({ view }: { view: SheetView }) {
             {!t!.complete && <span className="flag">incomplete</span>}
           </div>
         ))}
-        {totals.length === 0 && <div className="hint">Tick “Add up” on a column (click its header) to get totals.</div>}
+        {totals.length === 0 && (
+          <div className="hint">No totals yet: click a column's header and tick “Add up”, or add a calculated column with “+ Column”.</div>
+        )}
       </div>
       <div className="detail">
         <div>
@@ -730,7 +755,7 @@ function SheetTabs(props: {
         )}
       </div>
       <span className="hint">
-        Click a column header to edit it · ⌘C/⌘X/⌘V · ⇧⌘C/⇧⌘V transposed · ⌘D fill down · ⌘-click opens a link
+        Double-click a column header to edit it · + Column adds one · ⌘C/⌘X/⌘V · ⇧⌘C/⇧⌘V transposed · ⌘D fill down · ⌘-click opens a link
       </span>
     </nav>
   );

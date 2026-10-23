@@ -456,25 +456,16 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
       onDelete={onDelete}
       onCellClicked={onCellClicked}
       onHeaderMenuClick={(col, bounds) => onEditColumn(col, bounds)}
+      onHeaderClicked={(col, e) => {
+        // Double-click a header to edit the column; a single click selects it.
+        if (e.isDoubleClick) onEditColumn(col, e.bounds);
+      }}
       onHeaderContextMenu={(col, e) => {
         e.preventDefault();
         onEditColumn(col, e.bounds);
       }}
       onColumnMoved={onColumnMoved}
       onColumnResize={onColumnResize}
-      rightElement={
-        <button
-          className="add-column"
-          title="Add a column"
-          onClick={(e) => {
-            const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-            onEditColumn("new", { x: r.left, y: r.top, width: r.width, height: r.height });
-          }}
-        >
-          +
-        </button>
-      }
-      rightElementProps={{ sticky: false, fill: false }}
       rowMarkers="both"
       smoothScrollX
       smoothScrollY

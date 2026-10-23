@@ -12,3 +12,19 @@ repository = "https://github.com/paul-wolf/tally-spread"
 # much smaller target/ and faster builds. Our own crates keep full debug info.
 [profile.dev.package."*"]
 debug = false
+
+# DuckDB unoptimised is ~10x slower at everything (opening a project replays its
+# log through it), so it is optimised even in dev builds. One slow first build.
+[profile.dev.package.libduckdb-sys]
+opt-level = 2
+
+# The engine replays a project's whole log when it opens; unoptimised, a few
+# imported files make that take seconds. These are quick to build optimised.
+[profile.dev.package.tally-core]
+opt-level = 2
+[profile.dev.package.rust_decimal]
+opt-level = 2
+[profile.dev.package.chrono]
+opt-level = 2
+[profile.dev.package.serde_json]
+opt-level = 2

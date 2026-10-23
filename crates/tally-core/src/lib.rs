@@ -18,6 +18,7 @@ pub mod ops;
 pub mod project;
 pub mod sheet;
 pub mod templates;
+pub mod time;
 
 pub use error::{Error, Result};
 pub use money::{Currency, Rounding, RoundingScope};

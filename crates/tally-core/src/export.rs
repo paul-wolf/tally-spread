@@ -25,6 +25,24 @@ fn num(s: &str) -> Option<f64> {
     Decimal::from_str(s).ok().and_then(|d| d.to_f64())
 }
 
+/// A stored date or moment as an Excel serial number (days since 1899-12-30, in
+/// local time), and whether it has a time of day.
+fn excel_time(v: &str) -> Option<(f64, bool)> {
+    use chrono::{Local, NaiveDate, Timelike};
+    let epoch = NaiveDate::from_ymd_opt(1899, 12, 30)?;
+    if v.len() == 10 {
+        let d = NaiveDate::parse_from_str(v, "%Y-%m-%d").ok()?;
+        return Some(((d - epoch).num_days() as f64, false));
+    }
+    if !v.contains('T') {
+        return None;
+    }
+    let t = chrono::DateTime::parse_from_rfc3339(v).ok()?.with_timezone(&Local).naive_local();
+    let day = (t.date() - epoch).num_days() as f64;
+    let secs = t.num_seconds_from_midnight() as f64 + t.nanosecond() as f64 / 1e9;
+    Some((day + secs / 86_400.0, true))
+}
+
 pub fn export_xlsx(view: &SheetView, path: &Path) -> Result<()> {
     let mut wb = Workbook::new();
     let ws = wb.add_worksheet();
@@ -95,6 +113,14 @@ pub fn export_xlsx(view: &SheetView, path: &Path) -> Result<()> {
             match (&c.kind, &cell.raw, &cell.value) {
                 (ColumnKind::Link, Some(url), _) if url.starts_with("http://") || url.starts_with("https://") => {
                     ws.write_url(row, col, Url::new(url.as_str()))?;
+                }
+                (ColumnKind::Date | ColumnKind::DateTime, Some(v), _) | (ColumnKind::Calc { .. }, None, Some(v))
+                    if excel_time(v).is_some() =>
+                {
+                    let (serial, with_time) = excel_time(v).unwrap();
+                    let f = Format::new().set_num_format(if with_time { "yyyy-mm-dd hh:mm:ss" } else { "yyyy-mm-dd" });
+                    let f = if c.style.bold { f.set_bold() } else { f };
+                    ws.write_number_with_format(row, col, serial, &f)?;
                 }
                 (ColumnKind::Number | ColumnKind::Money { .. }, Some(v), _) | (ColumnKind::Calc { .. }, None, Some(v)) => {
                     match num(v) {

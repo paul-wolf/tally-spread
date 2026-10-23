@@ -21,6 +21,11 @@ pub enum ColumnKind {
     Number,
     /// Amounts in one currency, e.g. a "UAH" price column.
     Money { currency: Currency },
+    /// A calendar date, stored as `2026-09-18`.
+    Date,
+    /// A moment in time, stored in UTC (`2026-09-18T10:46:16.13Z`) and shown in local time.
+    #[serde(rename = "datetime")]
+    DateTime,
     /// Computed for every row from a formula, e.g. `coalesce(to(price_uah, USD), price_usd)`.
     /// Stored with column IDs (`coalesce(to(c4, USD), c5)`), so renames never break it.
     /// With a `currency`, results are amounts in that currency: other currencies are
@@ -175,6 +180,10 @@ pub enum Op {
     SetRowDeleted { sheet_id: String, row_id: String, deleted: bool },
     /// `None` clears the cell. Amounts are stored normalised (`1200.5`, not `1 200,50`).
     SetCell { sheet_id: String, row_id: String, col_id: String, value: Option<String> },
+
+    /// Many cells of one column at once, stored exactly as given (callers normalise):
+    /// converting a column to a new type, and undoing that.
+    SetCells { sheet_id: String, col_id: String, values: Vec<(String, Option<String>)> },
 
     /// Many new rows with their values at once (imports, big pastes): one log
     /// line and one bulk insert instead of an operation per cell.

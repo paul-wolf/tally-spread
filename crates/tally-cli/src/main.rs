@@ -314,6 +314,31 @@ fn fmt_value(v: Value) -> String {
         Value::Double(n) => n.to_string(),
         Value::Decimal(d) => d.to_string(),
         Value::Text(s) => s,
+        Value::Timestamp(unit, n) => {
+            use duckdb::types::TimeUnit;
+            let micros = match unit {
+                TimeUnit::Second => n * 1_000_000,
+                TimeUnit::Millisecond => n * 1_000,
+                TimeUnit::Microsecond => n,
+                TimeUnit::Nanosecond => n / 1_000,
+            };
+            chrono::DateTime::from_timestamp_micros(micros).map_or(n.to_string(), |t| t.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string())
+        }
+        Value::Date32(days) => chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+            .and_then(|e| e.checked_add_signed(chrono::Duration::days(days as i64)))
+            .map_or(days.to_string(), |d| d.to_string()),
+        Value::Interval { months, days, nanos } => {
+            let secs = nanos as f64 / 1e9;
+            let (h, m, s) = ((secs / 3600.0).floor(), ((secs % 3600.0) / 60.0).floor(), secs % 60.0);
+            let mut out = String::new();
+            if months != 0 {
+                out.push_str(&format!("{months} months "));
+            }
+            if days != 0 {
+                out.push_str(&format!("{days} days "));
+            }
+            out + &format!("{h:02}:{m:02}:{s:06.3}")
+        }
         other => format!("{other:?}"),
     }
 }

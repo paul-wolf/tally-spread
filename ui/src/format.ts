@@ -55,3 +55,19 @@ export function transpose<T>(grid: T[][]): T[][] {
   const width = Math.max(0, ...grid.map((r) => r.length));
   return Array.from({ length: width }, (_, c) => grid.map((r) => r[c]));
 }
+
+/** A stored moment ("2026-09-18T10:46:16.13Z") in local time: "2026-09-18 13:46:16". */
+export function localMoment(iso: string | null | undefined): string | null {
+  if (!iso || !/^\d{4}-\d\d-\d\dT\d\d:\d\d/.test(iso)) return null;
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return null;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/** Calculated values: numbers grouped, moments in local time, anything else as is. */
+export function showValue(v: string | null | undefined): string {
+  if (v == null) return "";
+  if (/^-?\d+(\.\d+)?$/.test(v)) return group(v);
+  return localMoment(v) ?? v;
+}

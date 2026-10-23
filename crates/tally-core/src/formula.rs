@@ -56,6 +56,8 @@ pub enum Value {
     Money(Decimal, Currency),
     Text(String),
     Currency(Currency),
+    Date(chrono::NaiveDate),
+    Time(chrono::DateTime<chrono::Utc>),
     Error(String),
 }
 
@@ -437,7 +439,7 @@ fn tok_text(t: &Tok) -> String {
     }
 }
 
-pub const FUNCTIONS: &[&str] = &["to", "coalesce", "round", "abs", "min", "max", "if"];
+pub const FUNCTIONS: &[&str] = &["to", "coalesce", "round", "abs", "min", "max", "if", "date"];
 
 pub fn parse(src: &str) -> Result<Expr, String> {
     let toks = tokenize(src)?;
@@ -464,6 +466,7 @@ fn check_calls(e: &Expr) -> Result<(), String> {
                 "to" => args.len() == 2,
                 "round" => args.len() == 1 || args.len() == 2,
                 "abs" => args.len() == 1,
+                "date" => args.len() == 1,
                 "if" => args.len() == 3,
                 _ => !args.is_empty(),
             };
@@ -679,7 +682,25 @@ fn describe(v: &Value) -> String {
         Value::Money(_, c) => format!("an amount in {c}"),
         Value::Text(t) => format!("text {t:?}"),
         Value::Currency(c) => format!("the currency {c}"),
+        Value::Date(_) => "a date".into(),
+        Value::Time(_) => "a date and time".into(),
         Value::Error(e) => e.clone(),
+    }
+}
+
+fn shift_date(d: chrono::NaiveDate, days: Decimal) -> Value {
+    use rust_decimal::prelude::ToPrimitive;
+    match days.trunc().to_i64().and_then(|n| d.checked_add_signed(chrono::Duration::days(n))) {
+        Some(d) => Value::Date(d),
+        None => Value::Error("date out of range".into()),
+    }
+}
+
+fn shift_time(t: chrono::DateTime<chrono::Utc>, secs: Decimal) -> Value {
+    use rust_decimal::prelude::ToPrimitive;
+    match (secs * Decimal::from(1_000_000)).trunc().to_i64().and_then(|us| t.checked_add_signed(chrono::Duration::microseconds(us))) {
+        Some(t) => Value::Time(t),
+        None => Value::Error("date out of range".into()),
     }
 }
 
@@ -711,6 +732,18 @@ fn binary(op: BinOp, a: Value, b: Value) -> Value {
         (BinOp::Div, Money(x, c1), Money(y, c2)) if c1 == c2 => {
             div(x, y).map_or(Error("division by zero".into()), Number)
         }
+
+        // Dates: the difference is in days, a number of days moves a date.
+        (BinOp::Sub, Date(x), Date(y)) => Number(Decimal::from((x - y).num_days())),
+        (BinOp::Add, Date(d), Number(n)) | (BinOp::Add, Number(n), Date(d)) => shift_date(d, n),
+        (BinOp::Sub, Date(d), Number(n)) => shift_date(d, -n),
+        // Moments: the difference is in seconds, a number of seconds moves a moment.
+        (BinOp::Sub, Time(x), Time(y)) => {
+            let micros = (x - y).num_microseconds().unwrap_or(i64::MAX);
+            Number(Decimal::new(micros, 6).normalize())
+        }
+        (BinOp::Add, Time(t), Number(n)) | (BinOp::Add, Number(n), Time(t)) => shift_time(t, n),
+        (BinOp::Sub, Time(t), Number(n)) => shift_time(t, -n),
         (op, a, b) => Error(format!(
             "cannot {} {} and {}",
             match op {
@@ -799,6 +832,13 @@ fn call(name: &str, args: &[Expr], ctx: &dyn Context) -> Value {
                 other => other,
             }
         }
+        // The (local) date of a moment, or a date read from text.
+        "date" => match eval(&args[0], ctx) {
+            Value::Time(t) => Value::Date(t.with_timezone(&chrono::Local).date_naive()),
+            Value::Text(s) => crate::time::parse_date(&s).map_or_else(|e| Value::Error(e.to_string()), Value::Date),
+            v @ (Value::Date(_) | Value::Empty | Value::Error(_)) => v,
+            other => Value::Error(format!("date() needs a date and time, not {}", describe(&other))),
+        },
         "abs" => match eval(&args[0], ctx) {
             Value::Number(x) => Value::Number(x.abs()),
             Value::Money(x, c) => Value::Money(x.abs(), c),
@@ -816,6 +856,8 @@ fn call(name: &str, args: &[Expr], ctx: &dyn Context) -> Value {
                         let cmp = match (&v, b) {
                             (Value::Number(x), Value::Number(y)) => x.cmp(y),
                             (Value::Money(x, c1), Value::Money(y, c2)) if c1 == c2 => x.cmp(y),
+                            (Value::Date(x), Value::Date(y)) => x.cmp(y),
+                            (Value::Time(x), Value::Time(y)) => x.cmp(y),
                             _ => return Value::Error(format!("{name}() needs values of one kind")),
                         };
                         let take = if name == "min" { cmp.is_lt() } else { cmp.is_gt() };
@@ -832,7 +874,7 @@ fn call(name: &str, args: &[Expr], ctx: &dyn Context) -> Value {
                 Value::Empty => false,
                 Value::Number(n) | Value::Money(n, _) => !n.is_zero(),
                 Value::Text(t) => !t.is_empty(),
-                Value::Currency(_) => true,
+                Value::Currency(_) | Value::Date(_) | Value::Time(_) => true,
                 Value::Error(e) => return Value::Error(e),
             };
             eval(if truthy { &args[1] } else { &args[2] }, ctx)

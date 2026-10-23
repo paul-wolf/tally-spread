@@ -9,6 +9,8 @@ export type ColumnKind =
   | { type: "link" }
   | { type: "number" }
   | { type: "money"; currency: string }
+  | { type: "date" }
+  | { type: "datetime" }
   | { type: "calc"; formula: string; currency?: string | null };
 
 /** name = display name ("Price (UAH)"); var = variable name ("price_uah"; empty = derive). */

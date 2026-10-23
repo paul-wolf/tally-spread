@@ -14,7 +14,7 @@ import {
 } from "@glideapps/glide-data-grid";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { newId } from "./api";
-import { group, padMinor } from "./format";
+import { group, localMoment, padMinor, showValue } from "./format";
 import type { ColumnView, Op, SheetView, Snapshot } from "./types";
 
 /** Empty rows always shown below the data, ready to type or paste into. */
@@ -114,6 +114,12 @@ export function acceptable(col: ColumnView, v: string): boolean {
   if (col.type === "money") {
     const named = namedCurrency(v);
     return looksLikeAmount(v) && (named === null || named === col.currency);
+  }
+  if (col.type === "date" || col.type === "datetime") {
+    const t = v.trim();
+    const date =
+      /^\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(t) || /^\d{1,2}[./-]\d{1,2}[./-]\d{4}/.test(t) || /^\d{1,2} [A-Za-z]{3,} \d{4}/.test(t) || /^[A-Za-z]{3,} \d{1,2} \d{4}/.test(t);
+    return date || (col.type === "datetime" && /^\d{9,16}(\.\d+)?$/.test(t));
   }
   return col.type !== "calc";
 }
@@ -215,6 +221,8 @@ const ICON: Record<ColumnView["type"], GridColumnIcon> = {
   link: GridColumnIcon.HeaderUri,
   number: GridColumnIcon.HeaderNumber,
   money: GridColumnIcon.HeaderNumber,
+  date: GridColumnIcon.HeaderDate,
+  datetime: GridColumnIcon.HeaderTime,
   calc: GridColumnIcon.HeaderMath,
 };
 
@@ -224,7 +232,7 @@ function contentWidth(view: SheetView, j: number): number | null {
   let longest = 0;
   for (const r of view.rows.slice(0, 200)) {
     const cell = r.cells[j];
-    const v = cell?.raw ?? cell?.value ?? "";
+    const v = showValue(cell?.raw ?? cell?.value ?? "");
     const n = c.type === "number" || c.type === "money" || c.type === "calc" ? v.length + Math.floor(v.length / 4) + 1 : v.length;
     if (n > longest) longest = n;
   }
@@ -344,9 +352,11 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
         if (c.type === "money") display = group(padMinor(raw, c.currency));
         else if (c.type === "number") display = group(raw);
         else if (c.type === "link") display = raw.replace(/^https?:\/\/(www\.)?/, "");
+        else if (c.type === "datetime") display = localMoment(raw) ?? raw;
         return {
           kind: GridCellKind.Text,
-          data: raw,
+          // Moments are edited in local time, as shown.
+          data: c.type === "datetime" ? display : raw,
           displayData: display,
           allowOverlay: true,
           contentAlign: isNumeric(c) ? "right" : "left",
@@ -362,7 +372,7 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
       return {
         kind: GridCellKind.Text,
         data: cell.value ?? "",
-        displayData: cell.error ? "!" : group(cell.value),
+        displayData: cell.error ? "!" : showValue(cell.value),
         allowOverlay: false,
         readonly: true,
         contentAlign: "right",

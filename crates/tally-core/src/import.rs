@@ -114,13 +114,35 @@ fn is_link(s: &str) -> bool {
     (l.starts_with("http://") || l.starts_with("https://") || l.starts_with("www.")) && !l.contains(' ')
 }
 
-/// The type a column's values suggest: numbers, amounts in one currency, links or text.
-pub fn infer_kind(values: &[&str]) -> ColumnKind {
+/// Headings that say a column of numbers holds times: `ts`, `time`, `timestamp`,
+/// `created_at`, `epoch`, `start_ts`, ….
+fn sounds_like_time(heading: &str) -> bool {
+    let h = heading.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    let words: Vec<&str> = h.split('_').filter(|w| !w.is_empty()).collect();
+    words.iter().any(|w| matches!(*w, "ts" | "time" | "timestamp" | "epoch" | "datetime" | "date"))
+        || h.ends_with("_at")
+        || h.ends_with("time")
+}
+
+/// The type a column's values suggest: numbers (or Unix times, when the heading
+/// says so), dates, dates and times, amounts in one currency, links or text.
+pub fn infer_kind(heading: &str, values: &[&str]) -> ColumnKind {
+    use crate::time::{from_epoch, parse_date, parse_moment};
     if values.is_empty() {
         return ColumnKind::Text;
     }
     if values.iter().all(|v| number(v).is_some()) {
+        let epoch = |v: &&str| v.parse::<f64>().ok().and_then(from_epoch).is_some();
+        if sounds_like_time(heading) && values.iter().all(epoch) {
+            return ColumnKind::DateTime;
+        }
         return ColumnKind::Number;
+    }
+    if values.iter().all(|v| !v.contains(':') && parse_date(v).is_ok()) {
+        return ColumnKind::Date;
+    }
+    if values.iter().all(|v| v.contains(':') && parse_moment(v).is_ok()) {
+        return ColumnKind::DateTime;
     }
     if values.iter().all(|v| is_link(v)) {
         return ColumnKind::Link;
@@ -165,7 +187,7 @@ pub fn sheet_ops(table: &Table, sheet_id: &str, name: &str) -> Vec<Op> {
         .collect();
     for (j, name) in names.iter().enumerate() {
         let values: Vec<&str> = table.rows.iter().filter_map(|r| r.get(j).and_then(|c| c.as_deref())).collect();
-        let kind = infer_kind(&values);
+        let kind = infer_kind(&table.headings[j], &values);
         let total = matches!(kind, ColumnKind::Money { .. });
         ops.push(Op::AddColumn {
             sheet_id: sheet_id.into(),
@@ -207,13 +229,25 @@ mod tests {
         let t = read_csv("name;price;link;n;flag\nA;₴1 200;https://x.com/a;1.5;True\nB;₴300,50;www.y.com;2e-3;False\n").unwrap();
         assert_eq!(t.headings, ["name", "price", "link", "n", "flag"]);
         let kinds: Vec<ColumnKind> = (0..5)
-            .map(|j| infer_kind(&t.rows.iter().filter_map(|r| r[j].as_deref()).collect::<Vec<_>>()))
+            .map(|j| infer_kind(&t.headings[j], &t.rows.iter().filter_map(|r| r[j].as_deref()).collect::<Vec<_>>()))
             .collect();
         assert_eq!(kinds[0], ColumnKind::Text);
         assert_eq!(kinds[1], ColumnKind::Money { currency: Currency::new("UAH").unwrap() });
         assert_eq!(kinds[2], ColumnKind::Link);
         assert_eq!(kinds[3], ColumnKind::Number);
         assert_eq!(kinds[4], ColumnKind::Text);
+    }
+
+    #[test]
+    fn dates_and_times() {
+        let k = |h: &str, v: &[&str]| infer_kind(h, v);
+        assert_eq!(k("ts", &["1789728376.130244", "1789728377.659081"]), ColumnKind::DateTime);
+        assert_eq!(k("rssi", &["1789728376", "1789728377"]), ColumnKind::Number);
+        assert_eq!(k("created_at", &["1789728376130"]), ColumnKind::DateTime);
+        assert_eq!(k("timestamp", &["2026-09-18T10:46:16.130244+00:00"]), ColumnKind::DateTime);
+        assert_eq!(k("when", &["2026-09-18 10:46"]), ColumnKind::DateTime);
+        assert_eq!(k("day", &["2026-09-18", "19.09.2026"]), ColumnKind::Date);
+        assert_eq!(k("ts", &["12", "13"]), ColumnKind::Number);
     }
 
     #[test]

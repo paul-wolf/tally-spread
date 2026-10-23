@@ -5,13 +5,15 @@ import type { ColumnSpec, ColumnView, UserFunction } from "./types";
 /** Where a column's values come from. */
 type Source = "typed" | "calc";
 /** What a column holds. Calculated columns are "any" (whatever the formula gives) or money/number. */
-type Type = "text" | "number" | "money" | "link" | "any";
+type Type = "text" | "number" | "money" | "link" | "date" | "datetime" | "any";
 
 const TYPED: { t: Type; label: string }[] = [
   { t: "text", label: "Text" },
   { t: "number", label: "Number" },
   { t: "money", label: "Money" },
   { t: "link", label: "Link" },
+  { t: "date", label: "Date" },
+  { t: "datetime", label: "Date & time" },
 ];
 const CALC: { t: Type; label: string }[] = [
   { t: "money", label: "Money" },
@@ -20,6 +22,7 @@ const CALC: { t: Type; label: string }[] = [
 
 /** Built-in functions, offered while typing a formula. */
 const BUILTINS: [string, string][] = [
+  ["date", "the day of a date & time"],
   ["coalesce", "first value that is filled in"],
   ["to", "to(amount, USD): convert"],
   ["round", "round(x, 2)"],
@@ -58,16 +61,29 @@ function suggestionsFor(
 
 /** Examples written with this sheet's own column names where possible. */
 function examples(cols: ColumnView[]): [string, string][] {
-  const money = cols.filter((c) => c.type === "money" || c.type === "calc").map((c) => c.var);
-  const num = cols.find((c) => c.type === "number")?.var ?? "qty";
-  const a = money[0] ?? "price_uah";
-  const b = money[1] ?? "price_usd";
-  return [
-    [`coalesce(${a}, ${b})`, `${a} if it's filled in, otherwise ${b}`],
-    [`${a} * ${num}`, "multiply two columns on the same row"],
-    [`to(${a}, USD)`, "convert to dollars at the sheet's rates"],
-    [`round(${a} * 1.2, 2)`, "round to 2 decimals"],
-  ];
+  const moneyCols = cols.filter((c) => c.type === "money" || (c.type === "calc" && c.currency)).map((c) => c.var);
+  const nums = cols.filter((c) => c.type === "number").map((c) => c.var);
+  const times = cols.filter((c) => c.type === "datetime").map((c) => c.var);
+  const dates = cols.filter((c) => c.type === "date").map((c) => c.var);
+  const out: [string, string][] = [];
+  if (times.length >= 2) out.push([`(${times[1]} - ${times[0]}) / 60`, "minutes between two times"]);
+  if (times.length >= 1) out.push([`date(${times[0]})`, "the day of a date & time"]);
+  if (dates.length) out.push([`${dates[0]} + 30`, "30 days later"]);
+  // Money examples when the sheet has money in it (or nothing else to show).
+  if (moneyCols.length || !out.length) {
+    const a = moneyCols[0] ?? "price_uah";
+    const b = moneyCols[1] ?? "price_usd";
+    const q = nums[0] ?? "qty";
+    out.push(
+      [`coalesce(${a}, ${b})`, `${a} if it's filled in, otherwise ${b}`],
+      [`${a} * ${q}`, "multiply two columns on the same row"],
+      [`to(${a}, USD)`, "convert to dollars at the sheet's rates"],
+    );
+  }
+  if (nums.length >= 2) out.push([`${nums[0]} * ${nums[1]}`, "multiply two columns on the same row"]);
+  const r = moneyCols[0] ?? nums[0] ?? "price_uah";
+  out.push([`round(${r} * 1.2, 2)`, "round to 2 decimals"]);
+  return out.slice(0, 5);
 }
 
 /** "Price (UAH)" -> price_uah, as the engine derives it. */
@@ -132,7 +148,7 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, functions 
   const currencyOk = /^[A-Z]{3}$/.test(currency.trim());
   // A name suggested from what the column holds, accepted with Tab or a click.
   const suggestion =
-    type === "money" && currencyOk ? (source === "calc" ? `Total (${currency})` : `Price (${currency})`) : type === "number" ? "Qty" : "";
+    type === "money" && currencyOk ? (source === "calc" ? `Total (${currency})` : `Price (${currency})`) : type === "number" ? "Qty" : type === "date" ? "Date" : type === "datetime" ? "Time" : "";
 
   useEffect(() => {
     if (!varTouched) setVarName(name ? varFromName(name) : "");
@@ -210,7 +226,7 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, functions 
     } else if (type === "money") {
       spec = { ...base, type: "money", currency };
     } else {
-      spec = { ...base, type: type as "text" | "number" | "link" };
+      spec = { ...base, type: type as "text" | "number" | "link" | "date" | "datetime" };
     }
     onSave(spec);
   };
@@ -218,8 +234,10 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, functions 
   const chooseSource = (s: Source) => {
     setSource(s);
     if (s === "calc") {
-      setType("money");
-      setTotal(true);
+      // A sheet with money in it most likely wants money; otherwise whatever the formula gives.
+      const money = others.some((c) => c.type === "money" || (c.type === "calc" && c.currency));
+      setType(money ? "money" : "any");
+      setTotal(money);
     } else if (type === "any") {
       setType("text");
     }
@@ -321,7 +339,7 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, functions 
                 setVarTouched(true);
                 setVarName(e.target.value);
               }}
-              className={varOk ? "mono" : "mono bad"}
+              className={varOk || !finalVar ? "mono" : "mono bad"}
               spellCheck={false}
             />
           </label>
@@ -374,7 +392,7 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, functions 
                     setAcOff(true);
                   }
                 }}
-                placeholder="Formula, e.g. coalesce(price_uah, price_usd)"
+                placeholder={`Formula, e.g. ${examples(others)[0]?.[0] ?? "coalesce(price_uah, price_usd)"}`}
                 className={preview?.ok === false ? "mono formula bad" : "mono formula"}
                 spellCheck={false}
                 autoComplete="off"

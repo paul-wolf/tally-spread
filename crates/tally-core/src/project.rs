@@ -154,6 +154,16 @@ pub fn read_settings(dir: &Path) -> Result<ProjectSettings> {
 }
 
 impl Project {
+    /// Run a statement, prepared once and cached: replaying a log runs the same
+    /// few statements thousands of times, and parsing them each time dominates.
+    fn run(&self, sql: &str, params: impl duckdb::Params) -> duckdb::Result<usize> {
+        self.conn.prepare_cached(sql)?.execute(params)
+    }
+
+    fn qrow<T>(&self, sql: &str, params: impl duckdb::Params, f: impl FnOnce(&duckdb::Row<'_>) -> duckdb::Result<T>) -> duckdb::Result<T> {
+        self.conn.prepare_cached(sql)?.query_row(params, f)
+    }
+
     /// Create a new project folder.
     pub fn create(dir: impl Into<PathBuf>, mut settings: ProjectSettings, machine: &str) -> Result<Self> {
         let dir = dir.into();
@@ -283,11 +293,14 @@ impl Project {
     }
 
     fn rebuild(&mut self) -> Result<()> {
+        // Cached statements point at the tables about to be replaced.
+        self.conn.flush_prepared_statement_cache();
         self.conn.execute_batch(
             "DROP TABLE IF EXISTS sheets; DROP TABLE IF EXISTS columns;
              DROP TABLE IF EXISTS sheet_rows; DROP TABLE IF EXISTS cells;",
         )?;
         self.conn.execute_batch(SCHEMA)?;
+        self.conn.set_prepared_statement_cache_capacity(64);
         let (entries, unreadable) = self.read_log()?;
         self.replay_warnings = unreadable;
         for e in &entries {
@@ -366,8 +379,8 @@ impl Project {
                 if self.sheet_exists(sheet_id)? {
                     return Err(Error::InvalidValue(format!("sheet {sheet_id} already exists")));
                 }
-                let position: i64 = self.conn.query_row("SELECT count(*) FROM sheets", [], |r| r.get(0))?;
-                self.conn.execute(
+                let position: i64 = self.qrow("SELECT count(*) FROM sheets", [], |r| r.get(0))?;
+                self.run(
                     "INSERT INTO sheets (sheet_id, name, position) VALUES (?, ?, ?)",
                     params![sheet_id, name, position],
                 )?;
@@ -379,7 +392,7 @@ impl Project {
             Op::RenameSheet { sheet_id, name } => {
                 let name = non_empty(name, "sheet name")?;
                 let old = self.sheet(sheet_id)?.name;
-                self.conn.execute("UPDATE sheets SET name = ? WHERE sheet_id = ?", params![name, sheet_id])?;
+                self.run("UPDATE sheets SET name = ? WHERE sheet_id = ?", params![name, sheet_id])?;
                 Ok((
                     Op::RenameSheet { sheet_id: sheet_id.clone(), name },
                     Op::RenameSheet { sheet_id: sheet_id.clone(), name: old },
@@ -405,7 +418,7 @@ impl Project {
                         unique.push(*s);
                     }
                 }
-                self.conn.execute(
+                self.run(
                     "UPDATE sheets SET sources = ? WHERE sheet_id = ?",
                     params![serde_json::to_string(&unique)?, sheet_id],
                 )?;
@@ -417,7 +430,7 @@ impl Project {
             Op::SetSheetBase { sheet_id, base } => {
                 let old = self.sheet(sheet_id)?.base;
                 let text = base.as_ref().map(|c| c.code().to_string()).unwrap_or_default();
-                self.conn.execute("UPDATE sheets SET base = ? WHERE sheet_id = ?", params![text, sheet_id])?;
+                self.run("UPDATE sheets SET base = ? WHERE sheet_id = ?", params![text, sheet_id])?;
                 Ok((op.clone(), Op::SetSheetBase { sheet_id: sheet_id.clone(), base: old }))
             }
             Op::SetSheetFixedRates { sheet_id, rates } => {
@@ -430,7 +443,7 @@ impl Project {
                     }
                     clean.push(FixedRate { base: r.base.clone(), quote: r.quote.clone(), rate: rate.to_string() });
                 }
-                self.conn.execute(
+                self.run(
                     "UPDATE sheets SET fixed_rates = ? WHERE sheet_id = ?",
                     params![serde_json::to_string(&clean)?, sheet_id],
                 )?;
@@ -448,7 +461,7 @@ impl Project {
                 }
                 finite(*position)?;
                 let spec = self.check_spec(sheet_id, &col_id, spec)?;
-                self.conn.execute(
+                self.run(
                     "INSERT INTO columns (sheet_id, col_id, position, name, spec) VALUES (?, ?, ?, ?, ?)",
                     params![sheet_id, col_id, position, spec.name, serde_json::to_string(&spec)?],
                 )?;
@@ -468,36 +481,29 @@ impl Project {
                 }
                 // The type changed: convert values that fit the new type ("UAH 3,250.00"
                 // -> 3250 in a UAH column); leave the rest as typed, shown as problems.
-                let mut done = vec![update];
-                let mut undo = vec![restore];
-                let items: Vec<String> =
+                let items: std::collections::HashSet<String> =
                     self.rows(sheet_id)?.into_iter().filter(|r| r.kind == RowKind::Item).map(|r| r.row_id).collect();
-                for row_id in items {
-                    let Some(raw) = self.cell(sheet_id, &row_id, col_id)? else { continue };
-                    let Ok(norm) = normalize_cell(&spec, &raw) else { continue };
-                    if norm == raw {
+                let mut values = Vec::new();
+                for (row_id, raw) in self.column_cells(sheet_id, col_id)? {
+                    if !items.contains(&row_id) {
                         continue;
                     }
-                    let (set, unset) = self.exec(&Op::SetCell {
-                        sheet_id: sheet_id.clone(),
-                        row_id,
-                        col_id: col_id.clone(),
-                        value: Some(norm),
-                    })?;
-                    done.push(set);
-                    undo.push(unset);
+                    let Ok(norm) = normalize_cell(&spec, &raw) else { continue };
+                    if norm != raw {
+                        values.push((row_id, Some(norm)));
+                    }
                 }
+                if values.is_empty() {
+                    return Ok((update, restore));
+                }
+                let (set, unset) = self.exec(&Op::SetCells { sheet_id: sheet_id.clone(), col_id: col_id.clone(), values })?;
                 // Undo restores the old type first, so the old text goes back unconverted.
-                if done.len() == 1 {
-                    Ok((done.pop().unwrap(), undo.pop().unwrap()))
-                } else {
-                    Ok((Op::Batch { ops: done }, Op::Batch { ops: undo }))
-                }
+                Ok((Op::Batch { ops: vec![update, set] }, Op::Batch { ops: vec![restore, unset] }))
             }
             Op::MoveColumn { sheet_id, col_id, position } => {
                 finite(*position)?;
                 let old = self.column(sheet_id, col_id)?.position;
-                self.conn.execute(
+                self.run(
                     "UPDATE columns SET position = ? WHERE sheet_id = ? AND col_id = ?",
                     params![position, sheet_id, col_id],
                 )?;
@@ -516,7 +522,7 @@ impl Project {
                         return Err(Error::InvalidValue(format!("column {} already uses that name", clash.col_id)));
                     }
                 }
-                self.conn.execute(
+                self.run(
                     "UPDATE columns SET deleted = ? WHERE sheet_id = ? AND col_id = ?",
                     params![deleted, sheet_id, col_id],
                 )?;
@@ -532,7 +538,7 @@ impl Project {
                     return Err(Error::InvalidValue(format!("row {row_id} already exists")));
                 }
                 finite(*position)?;
-                self.conn.execute(
+                self.run(
                     "INSERT INTO sheet_rows (sheet_id, row_id, position) VALUES (?, ?, ?)",
                     params![sheet_id, row_id, position],
                 )?;
@@ -543,7 +549,7 @@ impl Project {
             }
             Op::SetRowKind { sheet_id, row_id, kind } => {
                 let (old, _) = self.row_state(sheet_id, row_id)?.ok_or_else(|| Error::NotFound(format!("row {row_id}")))?;
-                self.conn.execute(
+                self.run(
                     "UPDATE sheet_rows SET kind = ? WHERE sheet_id = ? AND row_id = ?",
                     params![kind.as_str(), sheet_id, row_id],
                 )?;
@@ -551,7 +557,7 @@ impl Project {
             }
             Op::SetRowDeleted { sheet_id, row_id, deleted } => {
                 let (_, old) = self.row_state(sheet_id, row_id)?.ok_or_else(|| Error::NotFound(format!("row {row_id}")))?;
-                self.conn.execute(
+                self.run(
                     "UPDATE sheet_rows SET deleted = ? WHERE sheet_id = ? AND row_id = ?",
                     params![deleted, sheet_id, row_id],
                 )?;
@@ -572,12 +578,12 @@ impl Project {
                     Some(v) if row_kind == RowKind::Section => Some(v.to_string()),
                     Some(v) => Some(normalize_cell(&col.spec, v)?),
                 };
-                self.conn.execute(
+                self.run(
                     "DELETE FROM cells WHERE sheet_id = ? AND row_id = ? AND col_id = ?",
                     params![sheet_id, row_id, col_id],
                 )?;
                 if let Some(v) = &normalized {
-                    self.conn.execute(
+                    self.run(
                         "INSERT INTO cells (sheet_id, row_id, col_id, value) VALUES (?, ?, ?, ?)",
                         params![sheet_id, row_id, col_id, v],
                     )?;
@@ -590,13 +596,34 @@ impl Project {
                 };
                 Ok((make(normalized), make(old)))
             }
+            Op::SetCells { sheet_id, col_id, values } => {
+                self.column(sheet_id, col_id)?;
+                // Read the column, change it in memory, write it back in one go.
+                let mut cells: HashMap<String, String> = self.column_cells(sheet_id, col_id)?.into_iter().collect();
+                let mut old = Vec::with_capacity(values.len());
+                for (row_id, v) in values {
+                    old.push((row_id.clone(), cells.get(row_id).cloned()));
+                    match v {
+                        Some(v) => cells.insert(row_id.clone(), v.clone()),
+                        None => cells.remove(row_id),
+                    };
+                }
+                self.run("DELETE FROM cells WHERE sheet_id = ? AND col_id = ?", params![sheet_id, col_id])?;
+                {
+                    let mut app = self.conn.appender("cells")?;
+                    for (row_id, v) in &cells {
+                        app.append_row(params![sheet_id, row_id, col_id, v])?;
+                    }
+                }
+                Ok((op.clone(), Op::SetCells { sheet_id: sheet_id.clone(), col_id: col_id.clone(), values: old }))
+            }
             Op::InsertRows { sheet_id, rows } => {
                 self.sheet(sheet_id)?;
                 let columns: HashMap<String, ColumnSpec> =
                     self.columns(sheet_id)?.into_iter().map(|c| (c.col_id, c.spec)).collect();
                 let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
                 {
-                    let mut st = self.conn.prepare("SELECT row_id FROM sheet_rows WHERE sheet_id = ?")?;
+                    let mut st = self.conn.prepare_cached("SELECT row_id FROM sheet_rows WHERE sheet_id = ?")?;
                     let ids = st.query_map(params![sheet_id], |r| r.get::<_, String>(0))?;
                     for id in ids {
                         existing.insert(id?);
@@ -658,7 +685,7 @@ impl Project {
 
     /// The next column ID for a sheet: `c` + one more than any ID it ever had.
     fn next_col_id(&self, sheet_id: &str) -> Result<String> {
-        let mut stmt = self.conn.prepare("SELECT col_id FROM columns WHERE sheet_id = ?")?;
+        let mut stmt = self.conn.prepare_cached("SELECT col_id FROM columns WHERE sheet_id = ?")?;
         let ids = stmt.query_map(params![sheet_id], |r| r.get::<_, String>(0))?;
         let mut max = 0u32;
         for id in ids {
@@ -724,7 +751,7 @@ impl Project {
     }
 
     fn write_spec(&self, sheet_id: &str, col_id: &str, spec: &ColumnSpec) -> Result<()> {
-        self.conn.execute(
+        self.run(
             "UPDATE columns SET name = ?, spec = ? WHERE sheet_id = ? AND col_id = ?",
             params![spec.name, serde_json::to_string(spec)?, sheet_id, col_id],
         )?;
@@ -822,15 +849,22 @@ impl Project {
 
     fn sheet_exists(&self, sheet_id: &str) -> Result<bool> {
         let n: i64 =
-            self.conn.query_row("SELECT count(*) FROM sheets WHERE sheet_id = ?", params![sheet_id], |r| r.get(0))?;
+            self.qrow("SELECT count(*) FROM sheets WHERE sheet_id = ?", params![sheet_id], |r| r.get(0))?;
         Ok(n > 0)
     }
 
     /// (kind, deleted) of a row, if it exists.
+    /// (row ID, value) of every stored cell in a column.
+    fn column_cells(&self, sheet_id: &str, col_id: &str) -> Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare_cached("SELECT row_id, value FROM cells WHERE sheet_id = ? AND col_id = ?")?;
+        let rows = st.query_map(params![sheet_id, col_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     fn row_state(&self, sheet_id: &str, row_id: &str) -> Result<Option<(RowKind, bool)>> {
         Ok(self
-            .conn
-            .query_row(
+            
+            .qrow(
                 "SELECT kind, deleted FROM sheet_rows WHERE sheet_id = ? AND row_id = ?",
                 params![sheet_id, row_id],
                 |r| Ok((RowKind::parse(&r.get::<_, String>(0)?), r.get::<_, bool>(1)?)),
@@ -841,8 +875,8 @@ impl Project {
     /// (spec json, deleted) of a column, deleted or not.
     fn column_row(&self, sheet_id: &str, col_id: &str) -> Result<Option<(String, bool)>> {
         Ok(self
-            .conn
-            .query_row(
+            
+            .qrow(
                 "SELECT spec, deleted FROM columns WHERE sheet_id = ? AND col_id = ?",
                 params![sheet_id, col_id],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)),
@@ -865,8 +899,8 @@ impl Project {
 
     fn cell(&self, sheet_id: &str, row_id: &str, col_id: &str) -> Result<Option<String>> {
         Ok(self
-            .conn
-            .query_row(
+            
+            .qrow(
                 "SELECT value FROM cells WHERE sheet_id = ? AND row_id = ? AND col_id = ?",
                 params![sheet_id, row_id, col_id],
                 |r| r.get(0),
@@ -882,7 +916,7 @@ impl Project {
     }
 
     pub fn sheets(&self, include_archived: bool) -> Result<Vec<SheetInfo>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT sheet_id, name, archived, rates, sources, fixed_rates, base FROM sheets ORDER BY position, sheet_id",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -917,7 +951,7 @@ impl Project {
 
     /// Columns of a sheet in order, without deleted ones.
     pub fn columns(&self, sheet_id: &str) -> Result<Vec<ColumnInfo>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT col_id, position, spec FROM columns WHERE sheet_id = ? AND NOT deleted ORDER BY position, col_id",
         )?;
         let rows = stmt.query_map(params![sheet_id], |r| {
@@ -933,7 +967,7 @@ impl Project {
 
     /// Rows of a sheet in order, without deleted ones.
     pub fn rows(&self, sheet_id: &str) -> Result<Vec<RowInfo>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT row_id, position, kind FROM sheet_rows WHERE sheet_id = ? AND NOT deleted ORDER BY position, row_id",
         )?;
         let rows = stmt.query_map(params![sheet_id], |r| {
@@ -949,7 +983,7 @@ impl Project {
 
     /// All stored values of a sheet: (row_id, col_id) -> value.
     pub fn cells(&self, sheet_id: &str) -> Result<HashMap<(String, String), String>> {
-        let mut stmt = self.conn.prepare("SELECT row_id, col_id, value FROM cells WHERE sheet_id = ?")?;
+        let mut stmt = self.conn.prepare_cached("SELECT row_id, col_id, value FROM cells WHERE sheet_id = ?")?;
         let rows = stmt.query_map(params![sheet_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
         })?;
@@ -964,14 +998,14 @@ impl Project {
     /// A position after the last row of a sheet.
     pub fn next_row_position(&self, sheet_id: &str) -> Result<f64> {
         let max: Option<f64> =
-            self.conn.query_row("SELECT max(position) FROM sheet_rows WHERE sheet_id = ?", params![sheet_id], |r| r.get(0))?;
+            self.qrow("SELECT max(position) FROM sheet_rows WHERE sheet_id = ?", params![sheet_id], |r| r.get(0))?;
         Ok(max.map_or(1.0, |m| m.floor() + 1.0))
     }
 
     /// A position after the last column of a sheet.
     pub fn next_column_position(&self, sheet_id: &str) -> Result<f64> {
         let max: Option<f64> =
-            self.conn.query_row("SELECT max(position) FROM columns WHERE sheet_id = ?", params![sheet_id], |r| r.get(0))?;
+            self.qrow("SELECT max(position) FROM columns WHERE sheet_id = ?", params![sheet_id], |r| r.get(0))?;
         Ok(max.map_or(1.0, |m| m.floor() + 1.0))
     }
 }
@@ -1034,6 +1068,8 @@ pub fn normalize_cell(spec: &ColumnSpec, v: &str) -> Result<String> {
             }
             Ok(n.to_string())
         }
+        ColumnKind::Date => Ok(crate::time::store_date(&crate::time::parse_date(v)?)),
+        ColumnKind::DateTime => Ok(crate::time::store_moment(&crate::time::parse_moment(v)?)),
         ColumnKind::Calc { .. } => Err(Error::InvalidValue(format!("{} is calculated from a formula", spec.name))),
     }
 }
@@ -1319,5 +1355,42 @@ pub(crate) mod tests {
         assert_eq!(p.rows("s2").unwrap().len(), 2);
         assert!(p.undo().unwrap());
         assert!(p.sheet("s2").is_err() || p.rows("s2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn retyping_numbers_as_times_and_time_arithmetic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = Project::create(tmp.path(), ProjectSettings::new("t", Currency::new("GBP").unwrap()), "mac").unwrap();
+        let t = crate::import::read_csv("start,end,day\n1789728376.5,1789728436,18.09.2026\n").unwrap();
+        p.apply(Op::Batch { ops: crate::import::sheet_ops(&t, "s", "Flights") }).unwrap();
+        let cols = p.columns("s").unwrap();
+        assert_eq!(cols[0].spec.kind, ColumnKind::Number);
+        assert_eq!(cols[2].spec.kind, ColumnKind::Date);
+        for (id, name) in [("c1", "start"), ("c2", "end")] {
+            p.apply(Op::UpdateColumn {
+                sheet_id: "s".into(),
+                col_id: id.into(),
+                spec: ColumnSpec { name: name.into(), var: name.into(), kind: ColumnKind::DateTime, total: false, style: Default::default() },
+            })
+            .unwrap();
+        }
+        assert!(p.cells("s").unwrap().values().any(|v| v == "2026-09-18T10:46:16.500Z"), "{:?}", p.cells("s").unwrap());
+        p.apply(Op::AddColumn {
+            sheet_id: "s".into(),
+            col_id: String::new(),
+            position: 9.0,
+            spec: ColumnSpec { name: "Secs".into(), var: String::new(), kind: ColumnKind::Calc { formula: "end - start".into(), currency: None }, total: false, style: Default::default() },
+        })
+        .unwrap();
+        p.apply(Op::AddColumn {
+            sheet_id: "s".into(),
+            col_id: String::new(),
+            position: 10.0,
+            spec: ColumnSpec { name: "Next".into(), var: String::new(), kind: ColumnKind::Calc { formula: "day + 1".into(), currency: None }, total: false, style: Default::default() },
+        })
+        .unwrap();
+        let v = p.sheet_view("s", &crate::fx::RateTable::default(), chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()).unwrap();
+        assert_eq!(v.rows[0].cells[3].value.as_deref(), Some("59.5"), "{:?}", v.warnings);
+        assert_eq!(v.rows[0].cells[4].value.as_deref(), Some("2026-09-19"));
     }
 }

@@ -120,7 +120,9 @@ input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accen
 .tab input { width: 140px; padding: 2px 6px; }
 .tab .close { border: none; background: none; padding: 0 2px; color: var(--muted); font-size: 15px; line-height: 1; }
 .tabs .add { border: none; background: none; font-size: 17px; color: var(--muted); padding: 0 10px; }
-.tabs .hint { margin-left: auto; align-self: center; color: var(--muted); font-size: 11px; white-space: nowrap; padding-left: 16px; }
+.tabs .hint { margin-left: auto; align-self: center; color: var(--muted); font-size: 11px; white-space: nowrap; padding-left: 16px; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex-shrink: 1; }
+.tabs { scrollbar-width: thin; }
+.tab, .tabs .add-wrap { flex-shrink: 0; }
 
 .toast {
   display: flex;

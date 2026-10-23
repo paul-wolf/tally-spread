@@ -404,6 +404,8 @@ fn try_function(state: State<AppState>, function: UserFunction, expression: Stri
         Value::Money(n, c) => format!("{} {c}", n.normalize()),
         Value::Text(t) => t,
         Value::Currency(c) => c.to_string(),
+        Value::Date(d) => tally_core::time::store_date(&d),
+        Value::Time(t) => tally_core::time::show_moment(&t),
         Value::Error(e) => return Err(e),
     })
 }

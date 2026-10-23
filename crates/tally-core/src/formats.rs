@@ -63,11 +63,22 @@ fn grouped(s: &str) -> String {
     }
 }
 
+/// A stored moment (`2026-09-18T10:46:16Z`) in local time, as people read it.
+fn moment(v: &str) -> Option<String> {
+    if v.len() < 20 || !v.contains('T') {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(v).ok().map(|t| crate::time::show_moment(&t.with_timezone(&chrono::Utc)))
+}
+
 /// How a cell reads on paper.
 fn display(c: &ColumnView, cell: &CellView) -> String {
     let Some(v) = plain(c, cell) else {
         return if cell.error.is_some() { "!".into() } else { String::new() };
     };
+    if let Some(t) = moment(&v) {
+        return t;
+    }
     if !is_numeric(c) {
         return match c.kind {
             ColumnKind::Link => v.trim_start_matches("https://").trim_start_matches("http://").trim_start_matches("www.").to_string(),

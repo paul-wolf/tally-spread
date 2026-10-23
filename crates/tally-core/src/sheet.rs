@@ -126,6 +126,8 @@ fn input_value(kind: &ColumnKind, raw: Option<&String>) -> Value {
                 Err(_) => Value::Error(format!("{raw:?} is not an amount")),
             },
         },
+        ColumnKind::Date => crate::time::parse_date(raw).map_or_else(|e| Value::Error(e.to_string()), Value::Date),
+        ColumnKind::DateTime => crate::time::parse_moment(raw).map_or_else(|e| Value::Error(e.to_string()), Value::Time),
         ColumnKind::Calc { .. } => Value::Empty,
     }
 }
@@ -362,7 +364,7 @@ impl Sum {
 
     fn add(&mut self, v: &Value) {
         match v {
-            Value::Empty | Value::Text(_) | Value::Currency(_) => {}
+            Value::Empty | Value::Text(_) | Value::Currency(_) | Value::Date(_) | Value::Time(_) => {}
             Value::Error(_) => self.complete = false,
             Value::Number(n) => {
                 self.number += n;
@@ -630,6 +632,8 @@ impl Project {
                                 (Some(format_amount(round(*x, cur, settings.rounding), cur)), Some(cur.clone()), None)
                             }
                             Value::Number(x) if !c.spec.kind.is_input() => (Some(x.normalize().to_string()), None, None),
+                            Value::Date(d) if !c.spec.kind.is_input() => (Some(crate::time::store_date(d)), None, None),
+                            Value::Time(t) if !c.spec.kind.is_input() => (Some(crate::time::store_moment(t)), None, None),
                             Value::Money(_, cur) => (None, Some(cur.clone()), None),
                             Value::Error(e) => (None, None, Some(e.clone())),
                             _ => (None, None, None),
@@ -736,20 +740,33 @@ impl Project {
             let mut cols = vec!["\"row\" INTEGER".to_string(), "\"section\" VARCHAR".to_string()];
             let mut used = vec!["row".to_string(), "section".to_string()];
             let mut col_names = Vec::new();
-            for c in &view.columns {
+            for (j, c) in view.columns.iter().enumerate() {
                 let mut name = c.var.clone();
                 while used.contains(&name) {
                     name.push('_');
                 }
                 used.push(name.clone());
-                let numeric = !matches!(c.kind, ColumnKind::Text | ColumnKind::Link);
-                cols.push(format!("\"{name}\" {}", if numeric { "DECIMAL(38, 10)" } else { "VARCHAR" }));
-                col_names.push((name, numeric));
+                // SQL type, and how a value is cast into it (calculated columns may give anything).
+                let ty = match c.kind {
+                    ColumnKind::Text | ColumnKind::Link => "VARCHAR",
+                    ColumnKind::Date => "DATE",
+                    ColumnKind::DateTime => "TIMESTAMP", // UTC (TIMESTAMPTZ needs ICU)
+                    // Whatever the formula gives: judged by the first value.
+                    ColumnKind::Calc { .. } => match view.rows.iter().find_map(|r| r.cells[j].value.as_deref()) {
+                        Some(v) if Decimal::from_str(v).is_err() && crate::time::parse_date(v).is_ok() && v.len() == 10 => "DATE",
+                        Some(v) if Decimal::from_str(v).is_err() && crate::time::parse_moment(v).is_ok() => "TIMESTAMP",
+                        _ => "DECIMAL(38, 10)",
+                    },
+                    _ => "DECIMAL(38, 10)",
+                };
+                let cast = if ty == "VARCHAR" { "?".to_string() } else { format!("TRY_CAST(? AS {ty})") };
+                cols.push(format!("\"{name}\" {ty}"));
+                col_names.push((name, cast));
             }
             conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{table}\"; CREATE TABLE \"{table}\" ({});", cols.join(", ")))?;
             let placeholders: Vec<String> = std::iter::once("?".to_string())
                 .chain(std::iter::once("?".to_string()))
-                .chain(col_names.iter().map(|(_, num)| if *num { "CAST(? AS DECIMAL(38, 10))".into() } else { "?".into() }))
+                .chain(col_names.iter().map(|(_, cast)| cast.to_string()))
                 .collect();
             let sql = format!("INSERT INTO \"{table}\" VALUES ({})", placeholders.join(", "));
             let mut section: Option<String> = None;
@@ -759,10 +776,9 @@ impl Project {
                     continue;
                 }
                 let mut values: Vec<Option<String>> = vec![Some((i + 1).to_string()), section.clone()];
-                for (j, (_, numeric)) in col_names.iter().enumerate() {
+                for j in 0..col_names.len() {
                     let cell = &r.cells[j];
-                    let v = cell.raw.clone().or_else(|| cell.value.clone());
-                    values.push(if *numeric { v.filter(|x| Decimal::from_str(x).is_ok()) } else { v });
+                    values.push(cell.raw.clone().or_else(|| cell.value.clone()));
                 }
                 conn.execute(&sql, duckdb::params_from_iter(values.iter()))?;
             }

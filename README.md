@@ -8,25 +8,30 @@ Tally is not an Excel clone. It is a keyboard-first table tool built on DuckDB, 
 - **Design doc:** https://claude.ai/artifact/QQdXFgm7XTf5iW4VcSS8N9
 - **Repo:** https://github.com/paul-wolf/tally-spread (product name Tally; package name `tally-spread`)
 
-Status: first skeleton. Cost lists work end to end; AI, links-to-rows, taxes and PDF are next.
+Status: early but usable. Sheets with your own columns, calculated columns, sections, rates and XLSX export work; AI, links-to-rows, taxes and PDF are next.
 
 ## What works now
 
-- **Cost lists**: item, link, quantity, unit price and currency per row; rows in any mix of currencies.
-- **Display currencies per sheet** (e.g. `GBP, UAH`), each with a converted column and a total.
-- **Exchange rates** from HMRC (monthly, for UK records), the National Bank of Ukraine and the ECB, plus rates entered by hand. Sheets use **live** rates or rates **locked** to a date. Conversion picks a path through the rates in force on that date, preferring one source.
-- **Exact money**: decimal arithmetic, per-currency rounding (half-up by default), amounts typed as `₴12 499,50`, `£12.50`, `1,234.56` or `12.50 EUR` (a currency typed with the price sets the row's currency).
-- **Undo/redo** of everything; every change is an operation in an append-only log.
-- **Copy/paste** with Excel and Google Sheets (tab-separated), paste that adds rows, **transposed** copy and paste, fill down.
-- **Sheets as tabs**; **projects** as folders.
-- **XLSX export** with live `=SUM()` totals, clickable links and the rates used.
+- **Your own columns.** Columns are lettered A, B, C… and named as you like. Insert left or right, delete (undoable), drag to reorder, rename, change type. Each column has a type: **Text**, **Number**, **Link**, **Money** in one currency (e.g. a "UAH" column), or **Calculated**.
+- **Calculated columns.** One formula for the whole column, using column names:
+  - `coalesce(to(UAH, USD), USD)`: unit cost in USD from whichever price is filled in
+  - `[Unit USD] * Qty`: line total
+  - `to([Total USD], EUR)`: convert at the sheet's rates
+
+  Functions: `to`, `coalesce`, `round`, `abs`, `min`, `max`, `if`. Amounts keep their currency: adding UAH to USD is an error, never a silent mix. Renaming a column updates the formulas that use it. There are no per-cell formulas.
+- **Sections.** Any row can be a section heading; columns marked "Add up" get a subtotal on the heading and a sheet total.
+- **Exchange rates.** ECB (preferred), NBU and HMRC monthly, updated automatically. ECB does not publish hryvnia, so NBU covers UAH. Per sheet: preferred source, live or locked to a date, and fixed rates of your own (e.g. 1 USD = 44.92 UAH) that win over every source. The rates used are listed under the totals.
+- **Exact money**: decimal arithmetic, per-currency rounding; amounts typed as `₴12 499,50`, `$ 71.50`, `1,234.56` or `12.50 EUR`.
+- **Typing and pasting like a spreadsheet.** Blank rows are always there to type into. Paste from Excel or Google Sheets anywhere (a heading row is skipped; values that don't fit a column are left out and reported). Copy, cut, transposed copy and paste, fill down, undo/redo of everything.
+- **Sheets as tabs** (blank, or a spending-list template); **projects** as folders.
+- **XLSX export** with real `=SUM()` subtotals and totals, clickable links and the rates used.
 - **Two machines**: logs are per machine, so a synced folder (Syncthing) never has two writers per file; the app picks up the other machine's changes every few seconds.
-- **CLI** (`tally`) for the always-on hub: daily rate updates, conversions, SQL over a project.
+- **CLI** (`tally`) for the always-on hub: daily rate updates, conversions, printing a sheet, SQL over a project, export.
 
 ## Layout
 
 ```
-crates/tally-core   engine: money, rates, operations, projects (DuckDB), cost lists, XLSX export
+crates/tally-core   engine: money, rates, formulas, operations, projects (DuckDB), sheets, XLSX export
 crates/tally-cli    `tally` command line
 src-tauri           desktop app shell (Tauri 2)
 ui                  React UI with a canvas grid (Glide Data Grid)
@@ -63,26 +68,31 @@ cargo install --path crates/tally-cli   # the `tally` command
 tally rates update                      # HMRC monthly, NBU, ECB into ~/Tally/library
 tally rates status
 tally convert 12499.50 UAH GBP
-tally show my-costs
-tally sql my-costs "SELECT currency, sum(unit_price * coalesce(qty, 1)) FROM cost_items WHERE NOT deleted GROUP BY 1"
+tally show my-project
+tally sql my-project "SELECT section, sum(total_usd) FROM spending GROUP BY 1"   # each sheet is a table
 ```
 
 Run `tally rates update` daily, e.g. with cron: `15 7 * * * $HOME/.cargo/bin/tally rates update`.
 
 ## First-run defaults
 
-A new project starts with GBP as the reporting currency, `GBP, UAH` as display currencies, rate sources in the order HMRC monthly, NBU, ECB, manual, and the UK as tax home. Change them in the project's `project.json`.
+A new project prefers ECB rates (NBU for hryvnia), keeps GBP as its reporting currency and the UK as tax home, and starts with a spending-list sheet. Change project settings in its `project.json`.
+
+Projects made by the first skeleton version can't be opened; they are skipped.
 
 ## Keyboard
 
 | Keys | Action |
 | --- | --- |
-| Arrows, Enter, Tab, typing | Move and edit |
-| ⌘C / ⌘V | Copy / paste (tab-separated, works with Excel and Google Sheets) |
+| Arrows, Enter, Tab, typing | Move and edit; typing in a blank row starts a new row |
+| ⌘C / ⌘X / ⌘V | Copy / cut / paste (tab-separated, works with Excel and Google Sheets) |
 | ⇧⌘C / ⇧⌘V | Copy / paste transposed |
 | ⌘D | Fill down |
 | ⌘Z / ⇧⌘Z | Undo / redo |
+| ⌘Enter | Insert a row above the selection |
+| ⇧⌘S | Make the selected row a section heading (or back) |
 | Delete | Clear cells, or delete selected rows |
+| Click or right-click a column header | Edit the column: name, type, formula, insert, delete |
 | Ctrl+PageUp / PageDown | Previous / next sheet |
 | ⌘-click a link | Open it |
 

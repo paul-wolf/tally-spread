@@ -10,12 +10,12 @@ export const api = {
   sync: (sheetId: string | null) => invoke<Snapshot | null>("sync", { sheetId }),
   openProject: (dirName: string) => invoke<Snapshot>("open_project", { dirName }),
   createProject: (name: string) => invoke<Snapshot>("create_project", { name }),
+  createSheet: (name: string, template: "blank" | "spending") => invoke<Snapshot>("create_sheet", { name, template }),
+  checkFormula: (formula: string) => invoke<string | null>("check_formula", { formula }),
   saveSettings: (settings: ProjectSettings, sheetId: string | null) =>
     invoke<Snapshot>("save_settings", { settings, sheetId }),
   refreshRates: () => invoke<RefreshReport[]>("refresh_rates"),
   importRates: (source: RateSource, path: string) => invoke<number>("import_rates", { source, path }),
-  addManualRate: (base: string, quote: string, rate: string, date: string) =>
-    invoke<number>("add_manual_rate", { base, quote, rate, date }),
   exportXlsx: (sheetId: string, path: string) => invoke<void>("export_xlsx", { sheetId, path }),
 };
 

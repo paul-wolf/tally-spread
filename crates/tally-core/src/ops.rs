@@ -6,38 +6,64 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::fx::RateSource;
 use crate::money::Currency;
 use crate::{Error, Result};
 
-/// An editable column of a cost list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Column {
-    Item,
-    Url,
-    Qty,
-    UnitPrice,
-    Currency,
-    Note,
+/// What a column holds.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ColumnKind {
+    Text,
+    /// A web address; shown as a link.
+    Link,
+    /// A plain number, e.g. a quantity.
+    Number,
+    /// Amounts in one currency, e.g. a "UAH" price column.
+    Money { currency: Currency },
+    /// Computed for every row from a formula, e.g. `coalesce(to(UAH, USD), USD)`.
+    Calc { formula: String },
 }
 
-impl Column {
-    pub const ALL: [Column; 6] =
-        [Column::Item, Column::Url, Column::Qty, Column::UnitPrice, Column::Currency, Column::Note];
+impl ColumnKind {
+    pub fn is_input(&self) -> bool {
+        !matches!(self, ColumnKind::Calc { .. })
+    }
+}
 
-    pub fn sql_name(&self) -> &'static str {
+/// A column's definition. `total` adds the column up per section and for the sheet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnSpec {
+    pub name: String,
+    #[serde(flatten)]
+    pub kind: ColumnKind,
+    #[serde(default)]
+    pub total: bool,
+}
+
+/// Rows are items, or section headings that group the items below them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowKind {
+    #[default]
+    Item,
+    Section,
+}
+
+impl RowKind {
+    pub fn as_str(&self) -> &'static str {
         match self {
-            Column::Item => "item",
-            Column::Url => "url",
-            Column::Qty => "qty",
-            Column::UnitPrice => "unit_price",
-            Column::Currency => "currency",
-            Column::Note => "note",
+            RowKind::Item => "item",
+            RowKind::Section => "section",
         }
     }
 
-    pub fn is_decimal(&self) -> bool {
-        matches!(self, Column::Qty | Column::UnitPrice)
+    pub fn parse(s: &str) -> Self {
+        if s == "section" {
+            RowKind::Section
+        } else {
+            RowKind::Item
+        }
     }
 }
 
@@ -78,6 +104,15 @@ impl RateMode {
     }
 }
 
+/// A rate set by hand for one sheet: `1 base = rate quote`. It wins over any source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixedRate {
+    pub base: Currency,
+    pub quote: Currency,
+    /// Decimal as text, e.g. "44.92".
+    pub rate: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
@@ -85,15 +120,29 @@ pub enum Op {
     RenameSheet { sheet_id: String, name: String },
     /// Archived sheets are hidden but kept, so archiving can be undone.
     SetSheetArchived { sheet_id: String, archived: bool },
-    /// Display currencies of a sheet; empty means the project default.
-    SetSheetCurrencies { sheet_id: String, currencies: Vec<Currency> },
     SetSheetRates { sheet_id: String, rates: RateMode },
+    /// Rate sources in order of preference; empty means the project's.
+    SetSheetSources { sheet_id: String, sources: Vec<RateSource> },
+    /// Hand-set rates for this sheet; they win over every source.
+    SetSheetFixedRates { sheet_id: String, rates: Vec<FixedRate> },
+
+    /// `position` orders columns; insert between two with the midpoint.
+    AddColumn { sheet_id: String, col_id: String, position: f64, spec: ColumnSpec },
+    /// Change a column's name, type or formula. Renaming also updates formulas
+    /// in other columns that refer to it.
+    UpdateColumn { sheet_id: String, col_id: String, spec: ColumnSpec },
+    MoveColumn { sheet_id: String, col_id: String, position: f64 },
+    /// Deleted columns are hidden but kept (with their values), so deleting can be undone.
+    SetColumnDeleted { sheet_id: String, col_id: String, deleted: bool },
+
     /// `position` orders rows; insert between two rows with the midpoint.
     InsertRow { sheet_id: String, row_id: String, position: f64 },
+    SetRowKind { sheet_id: String, row_id: String, kind: RowKind },
     /// Deleted rows are hidden but kept, so deleting can be undone.
     SetRowDeleted { sheet_id: String, row_id: String, deleted: bool },
     /// `None` clears the cell. Amounts are stored normalised (`1200.5`, not `1 200,50`).
-    SetCell { sheet_id: String, row_id: String, column: Column, value: Option<String> },
+    SetCell { sheet_id: String, row_id: String, col_id: String, value: Option<String> },
+
     /// Several operations applied, logged and undone as one.
     Batch { ops: Vec<Op> },
 }
@@ -120,16 +169,20 @@ mod tests {
 
     #[test]
     fn op_json_is_readable() {
-        let op = Op::SetCell {
+        let op = Op::AddColumn {
             sheet_id: "s".into(),
-            row_id: "r".into(),
-            column: Column::UnitPrice,
-            value: Some("12.5".into()),
+            col_id: "c".into(),
+            position: 3.0,
+            spec: ColumnSpec {
+                name: "UAH".into(),
+                kind: ColumnKind::Money { currency: Currency::new("UAH").unwrap() },
+                total: false,
+            },
         };
         let json = serde_json::to_string(&op).unwrap();
         assert_eq!(
             json,
-            r#"{"op":"set_cell","sheet_id":"s","row_id":"r","column":"unit_price","value":"12.5"}"#
+            r#"{"op":"add_column","sheet_id":"s","col_id":"c","position":3.0,"spec":{"name":"UAH","type":"money","currency":"UAH","total":false}}"#
         );
         assert_eq!(serde_json::from_str::<Op>(&json).unwrap(), op);
     }

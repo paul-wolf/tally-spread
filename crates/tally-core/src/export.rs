@@ -1,22 +1,23 @@
-//! Export a cost list to XLSX. Totals are real `=SUM()` formulas, so the file keeps
-//! working as a spreadsheet; links stay clickable.
+//! Export a sheet to XLSX. Totals and section subtotals are real `=SUM()`
+//! formulas, so the file keeps working as a spreadsheet; links stay clickable.
 
 use std::path::Path;
+use std::str::FromStr;
 
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use rust_xlsxwriter::{Format, FormatBorder, Formula, Url, Workbook};
-use std::str::FromStr;
+use rust_xlsxwriter::{Color, Format, FormatBorder, Formula, Url, Workbook};
 
-use crate::costlist::CostListView;
 use crate::money::Currency;
-use crate::ops::RateMode;
+use crate::ops::{ColumnKind, RateMode, RowKind};
+use crate::sheet::{col_letter, SheetView};
 use crate::Result;
 
-fn number_format(c: &Currency) -> String {
-    match c.minor_units() {
-        0 => "#,##0".into(),
-        n => format!("#,##0.{}", "0".repeat(n as usize)),
+fn number_format(c: Option<&Currency>) -> String {
+    match c.map(|c| c.minor_units()) {
+        Some(0) => "#,##0".into(),
+        Some(n) => format!("#,##0.{}", "0".repeat(n as usize)),
+        None => "#,##0.########".into(),
     }
 }
 
@@ -24,18 +25,7 @@ fn num(s: &str) -> Option<f64> {
     Decimal::from_str(s).ok().and_then(|d| d.to_f64())
 }
 
-fn col_letter(mut col: u16) -> String {
-    let mut s = String::new();
-    col += 1;
-    while col > 0 {
-        let rem = (col - 1) % 26;
-        s.insert(0, (b'A' + rem as u8) as char);
-        col = (col - 1) / 26;
-    }
-    s
-}
-
-pub fn export_xlsx(view: &CostListView, path: &Path) -> Result<()> {
+pub fn export_xlsx(view: &SheetView, path: &Path) -> Result<()> {
     let mut wb = Workbook::new();
     let ws = wb.add_worksheet();
     let sheet_name: String = view.name.chars().filter(|c| !"[]:*?/\\".contains(*c)).take(31).collect();
@@ -43,110 +33,125 @@ pub fn export_xlsx(view: &CostListView, path: &Path) -> Result<()> {
         ws.set_name(sheet_name.trim())?;
     }
 
-    let bold = Format::new().set_bold();
     let header = Format::new().set_bold().set_border_bottom(FormatBorder::Thin);
-    let total_label = Format::new().set_bold().set_border_top(FormatBorder::Thin);
-    let quiet = Format::new().set_font_color("#666666");
+    let section = Format::new().set_bold().set_background_color(Color::RGB(0xF0F0EC));
+    let total_fmt = Format::new().set_bold().set_border_top(FormatBorder::Thin);
+    let quiet = Format::new().set_font_color(Color::RGB(0x666666));
 
-    let mut headers: Vec<String> =
-        ["Item", "Link", "Qty", "Unit price", "Currency", "Line total"].iter().map(|s| s.to_string()).collect();
-    for c in &view.currencies {
-        headers.push(format!("Total {c}"));
-    }
-    for (i, h) in headers.iter().enumerate() {
-        ws.write_string_with_format(0, i as u16, h, &header)?;
+    for (j, c) in view.columns.iter().enumerate() {
+        ws.write_string_with_format(0, j as u16, &c.name, &header)?;
+        let width = match &c.kind {
+            ColumnKind::Text => 30.0,
+            ColumnKind::Link => 34.0,
+            ColumnKind::Number => 8.0,
+            _ => 14.0,
+        };
+        ws.set_column_width(j as u16, width)?;
     }
 
-    let first_data = 1u32;
+    // Which column currency to format each column with (from its first value).
+    let col_currency: Vec<Option<Currency>> = (0..view.columns.len())
+        .map(|j| match &view.columns[j].kind {
+            ColumnKind::Money { currency } => Some(currency.clone()),
+            _ => view.rows.iter().find_map(|r| r.cells[j].currency.clone()),
+        })
+        .collect();
+
+    let first = 1u32;
+    let last_row = first + view.rows.len() as u32; // exclusive
     for (i, r) in view.rows.iter().enumerate() {
-        let row = first_data + i as u32;
-        if let Some(item) = &r.item {
-            ws.write_string(row, 0, item)?;
-        }
-        if let Some(url) = &r.url {
-            if url.starts_with("http://") || url.starts_with("https://") {
-                ws.write_url(row, 1, Url::new(url.as_str()))?;
-            } else {
-                ws.write_string(row, 1, url)?;
+        let row = first + i as u32;
+        if r.kind == RowKind::Section {
+            // Subtotal formulas over the rows up to the next section.
+            let end = view.rows[i + 1..]
+                .iter()
+                .position(|x| x.kind == RowKind::Section)
+                .map_or(last_row, |k| row + 1 + k as u32);
+            for (j, c) in view.columns.iter().enumerate() {
+                let col = j as u16;
+                let fmt = section.clone().set_num_format(number_format(col_currency[j].as_ref()));
+                if c.total && end > row + 1 {
+                    let l = col_letter(j);
+                    let mut f = Formula::new(format!("=SUM({l}{}:{l}{})", row + 2, end));
+                    if let Some(v) = &r.cells[j].value {
+                        f = f.set_result(v);
+                    }
+                    ws.write_formula_with_format(row, col, f, &fmt)?;
+                } else if let Some(raw) = &r.cells[j].raw {
+                    ws.write_string_with_format(row, col, raw, &section)?;
+                } else {
+                    ws.write_blank(row, col, &section)?;
+                }
             }
+            continue;
         }
-        if let Some(q) = r.qty.as_deref().and_then(num) {
-            ws.write_number(row, 2, q)?;
-        }
-        let row_cur = r.currency.as_deref().and_then(|c| Currency::new(c).ok());
-        if let Some(p) = r.unit_price.as_deref().and_then(num) {
-            ws.write_number(row, 3, p)?;
-        }
-        if let Some(c) = &r.currency {
-            ws.write_string(row, 4, c)?;
-        }
-        if let (Some(t), Some(c)) = (r.line_total.as_deref().and_then(num), &row_cur) {
-            ws.write_number_with_format(row, 5, t, &Format::new().set_num_format(number_format(c)))?;
-        }
-        for (j, c) in view.currencies.iter().enumerate() {
-            if let Some(v) = r.converted[j].as_deref().and_then(num) {
-                ws.write_number_with_format(row, 6 + j as u16, v, &Format::new().set_num_format(number_format(c)))?;
+        for (j, c) in view.columns.iter().enumerate() {
+            let col = j as u16;
+            let cell = &r.cells[j];
+            let fmt = Format::new().set_num_format(number_format(col_currency[j].as_ref()));
+            match (&c.kind, &cell.raw, &cell.value) {
+                (ColumnKind::Link, Some(url), _) if url.starts_with("http://") || url.starts_with("https://") => {
+                    ws.write_url(row, col, Url::new(url.as_str()))?;
+                }
+                (ColumnKind::Number | ColumnKind::Money { .. }, Some(v), _) | (ColumnKind::Calc { .. }, None, Some(v)) => {
+                    match num(v) {
+                        Some(n) => {
+                            ws.write_number_with_format(row, col, n, &fmt)?;
+                        }
+                        None => {
+                            ws.write_string(row, col, v)?;
+                        }
+                    }
+                }
+                (_, Some(v), _) => {
+                    ws.write_string(row, col, v)?;
+                }
+                _ => {}
             }
         }
     }
 
-    let total_row = first_data + view.rows.len() as u32;
-    ws.write_string_with_format(total_row, 0, "Total", &total_label)?;
-    for col in 1..6u16 {
-        ws.write_blank(total_row, col, &total_label)?;
-    }
-    for (j, (c, t)) in view.currencies.iter().zip(&view.totals).enumerate() {
-        let col = 6 + j as u16;
-        let letter = col_letter(col);
-        let formula = if view.rows.is_empty() {
-            Formula::new("=0")
+    // Grand totals: SUM over item rows only, so subtotals are not counted twice.
+    let total_row = last_row;
+    let item_rows: Vec<u32> =
+        view.rows.iter().enumerate().filter(|(_, r)| r.kind == RowKind::Item).map(|(i, _)| first + i as u32 + 1).collect();
+    let has_sections = view.rows.iter().any(|r| r.kind == RowKind::Section);
+    let mut wrote_label = false;
+    for (j, c) in view.columns.iter().enumerate() {
+        let col = j as u16;
+        let Some(t) = &view.totals[j] else { continue };
+        let l = col_letter(j);
+        let expr = if view.rows.is_empty() {
+            "=0".to_string()
+        } else if has_sections {
+            let refs: Vec<String> = item_rows.iter().map(|r| format!("{l}{r}")).collect();
+            format!("=SUM({})", refs.join(","))
         } else {
-            Formula::new(format!("=SUM({letter}{}:{letter}{})", first_data + 1, total_row))
+            format!("=SUM({l}{}:{l}{})", first + 1, last_row)
+        };
+        let fmt = total_fmt.clone().set_num_format(number_format(col_currency[j].as_ref()));
+        ws.write_formula_with_format(total_row, col, Formula::new(expr).set_result(&t.amount), &fmt)?;
+        if j > 0 && !wrote_label && c.total {
+            ws.write_string_with_format(total_row, 0, "Total", &total_fmt)?;
+            wrote_label = true;
         }
-        .set_result(&t.amount);
-        let fmt = Format::new().set_bold().set_border_top(FormatBorder::Thin).set_num_format(number_format(c));
-        ws.write_formula_with_format(total_row, col, formula, &fmt)?;
     }
 
-    let mut note_row = total_row + 2;
+    let mut note = total_row + 2;
     let mode = match &view.rates {
         RateMode::Live => format!("Rates as of {} (live)", view.as_of),
         RateMode::Locked { date } => format!("Rates locked at {date}"),
     };
-    ws.write_string_with_format(note_row, 0, &mode, &bold)?;
+    ws.write_string_with_format(note, 0, &mode, &quiet)?;
     for leg in &view.rates_used {
-        note_row += 1;
-        let text = format!("1 {} = {} {} ({}, {})", leg.from, leg.rate, leg.to, leg.source, leg.date);
-        ws.write_string_with_format(note_row, 0, &text, &quiet)?;
+        note += 1;
+        ws.write_string_with_format(note, 0, &format!("1 {} = {} {} ({}, {})", leg.from, leg.rate, leg.to, leg.source, leg.date), &quiet)?;
     }
     for w in &view.warnings {
-        note_row += 1;
-        ws.write_string_with_format(note_row, 0, &format!("Note: {w}"), &quiet)?;
-    }
-
-    ws.set_column_width(0, 32)?;
-    ws.set_column_width(1, 36)?;
-    ws.set_column_width(2, 6)?;
-    ws.set_column_width(3, 12)?;
-    ws.set_column_width(4, 9)?;
-    for col in 5..(6 + view.currencies.len() as u16) {
-        ws.set_column_width(col, 14)?;
+        note += 1;
+        ws.write_string_with_format(note, 0, &format!("Note: {w}"), &quiet)?;
     }
     ws.set_freeze_panes(1, 0)?;
-
     wb.save(path)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn column_letters() {
-        assert_eq!(col_letter(0), "A");
-        assert_eq!(col_letter(6), "G");
-        assert_eq!(col_letter(25), "Z");
-        assert_eq!(col_letter(26), "AA");
-    }
 }

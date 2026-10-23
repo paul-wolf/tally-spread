@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { GridSelection } from "@glideapps/glide-data-grid";
+import type { GridSelection, Rectangle } from "@glideapps/glide-data-grid";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { api, newId } from "./api";
-import { CostGrid, emptySelection, opsForBlock, opsForClear, selectedBlock } from "./CostGrid";
+import { ColumnEditor } from "./ColumnEditor";
 import { money, parseTsv, shortDate, todayIso, toTsv, transpose } from "./format";
-import type { Op, RateSource, Snapshot } from "./types";
+import { SheetGrid, emptySelection, opsForBlock, opsForClear, positionBetween, selectedBlock } from "./SheetGrid";
+import type { ColumnSpec, FixedRate, Op, RateSource, SheetView, Snapshot } from "./types";
+import { SOURCE_LABEL } from "./types";
 
 const SYNC_EVERY_MS = 5000;
 
@@ -26,18 +28,26 @@ const isTyping = (e: KeyboardEvent) => {
   return !!t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
 };
 
+/** Which column the editor is open for: an existing one, or a new one at a position. */
+type Editing =
+  | { mode: "edit"; index: number; at: { x: number; y: number } }
+  | { mode: "new"; position: number; at: { x: number; y: number } };
+
 export default function App() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [sheetId, setSheetId] = useState<string | null>(null);
   const [selection, setSelection] = useState<GridSelection>(emptySelection);
   const [message, setMessage] = useState<{ text: string; error?: boolean } | null>(null);
   const [rateBusy, setRateBusy] = useState(false);
+  const [editing, setEditing] = useState<Editing | null>(null);
   const dark = usePrefersDark();
 
   const sheetRef = useRef<string | null>(null);
   sheetRef.current = sheetId;
   const snapRef = useRef<Snapshot | null>(null);
   snapRef.current = snap;
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
 
   const show = useCallback((s: Snapshot) => {
     setSnap(s);
@@ -72,7 +82,7 @@ export default function App() {
         if (!quiet || failed.length) {
           setMessage({
             text: failed.length
-              ? `Could not update ${failed.map((r) => r.source.toUpperCase()).join(", ")}: ${failed[0].message}`
+              ? `Could not update ${failed.map((r) => SOURCE_LABEL[r.source]).join(", ")}: ${failed[0].message}`
               : added
                 ? `Rates updated (${added} new).`
                 : "Rates are up to date.",
@@ -109,14 +119,11 @@ export default function App() {
 
   useEffect(() => {
     if (!message || message.error) return;
-    const t = setTimeout(() => setMessage(null), 4000);
+    const t = setTimeout(() => setMessage(null), 5000);
     return () => clearTimeout(t);
   }, [message]);
 
   const view = snap?.sheet ?? null;
-
-  const selectionRef = useRef(selection);
-  selectionRef.current = selection;
 
   /** Copy the selection as tab-separated text (Excel and Google Sheets read it). */
   const copy = useCallback(
@@ -174,27 +181,74 @@ export default function App() {
     [apply, fail],
   );
 
+  /** Rows the selection touches (whole rows, or the rows of the selected range). */
+  const selectedRows = useCallback((): number[] => {
+    const v = snapRef.current?.sheet;
+    const sel = selectionRef.current;
+    if (!v) return [];
+    let ys = sel.rows.toArray();
+    if (!ys.length && sel.current) {
+      const r = sel.current.range;
+      ys = Array.from({ length: r.height }, (_, i) => r.y + i);
+    }
+    return ys.filter((y) => y < v.rows.length);
+  }, []);
+
+  const insertRowAbove = useCallback(() => {
+    const v = snapRef.current?.sheet;
+    if (!v) return;
+    const ys = selectedRows();
+    const y = ys.length ? Math.min(...ys) : v.rows.length;
+    const position = positionBetween(v.rows[y - 1]?.position, v.rows[y]?.position);
+    void apply({ op: "insert_row", sheet_id: v.sheet_id, row_id: newId(), position });
+  }, [apply, selectedRows]);
+
+  /** Turn the selected rows into section headings, or back into items. */
+  const toggleSection = useCallback(() => {
+    const v = snapRef.current?.sheet;
+    if (!v) return;
+    const ys = selectedRows();
+    if (!ys.length) {
+      setMessage({ text: "Select a row first; it becomes the section heading." });
+      return;
+    }
+    const makeSection = v.rows[ys[0]].kind !== "section";
+    const ops: Op[] = ys.map((y) => ({
+      op: "set_row_kind",
+      sheet_id: v.sheet_id,
+      row_id: v.rows[y].row_id,
+      kind: makeSection ? "section" : "item",
+    }));
+    void apply(ops.length === 1 ? ops[0] : { op: "batch", ops });
+  }, [apply, selectedRows]);
+
   // Keyboard shortcuts that sit above the grid.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
-      if (!mod) return;
+      if (!mod || isTyping(e) || editing) return;
       const k = e.key.toLowerCase();
-      if (!isTyping(e) && k === "z") {
+      if (k === "z") {
         e.preventDefault();
         void run(e.shiftKey ? api.redo(sheetRef.current) : api.undo(sheetRef.current));
-      } else if (!isTyping(e) && k === "y") {
+      } else if (k === "y") {
         e.preventDefault();
         void run(api.redo(sheetRef.current));
-      } else if (k === "v" && !isTyping(e)) {
+      } else if (k === "v") {
         e.preventDefault();
         void paste(e.shiftKey);
-      } else if (k === "c" && !isTyping(e)) {
+      } else if (k === "c") {
         e.preventDefault();
         void copy(e.shiftKey, false);
-      } else if (k === "x" && !isTyping(e)) {
+      } else if (k === "x") {
         e.preventDefault();
         void copy(false, true);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        insertRowAbove();
+      } else if (e.shiftKey && k === "s") {
+        e.preventDefault();
+        toggleSection();
       } else if (e.key === "PageDown" || e.key === "PageUp") {
         const sheets = snapRef.current?.sheets ?? [];
         const i = sheets.findIndex((s) => s.sheet_id === sheetRef.current);
@@ -209,11 +263,24 @@ export default function App() {
     // Capture phase, so the shortcuts work while the grid has focus.
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [run, paste, copy]);
+  }, [run, paste, copy, insertRowAbove, toggleSection, editing]);
+
+  const openColumnEditor = useCallback((index: number | "new", at: Rectangle) => {
+    const v = snapRef.current?.sheet;
+    if (!v) return;
+    const where = { x: at.x, y: at.y + at.height + 4 };
+    if (index === "new") {
+      setEditing({ mode: "new", position: positionBetween(v.columns[v.columns.length - 1]?.position, undefined), at: where });
+    } else {
+      setEditing({ mode: "edit", index, at: where });
+    }
+  }, []);
 
   if (!snap) {
     return <div className="loading">{message?.text ?? "Opening Tally…"}</div>;
   }
+
+  const editedColumn = editing?.mode === "edit" && view ? view.columns[editing.index] ?? null : null;
 
   return (
     <div className="app">
@@ -240,15 +307,6 @@ export default function App() {
             fail(e);
           }
         }}
-        onAddRate={async (base, quote, rate, date) => {
-          try {
-            await api.addManualRate(base, quote, rate, date);
-            setMessage({ text: `Added 1 ${base} = ${rate} ${quote}.` });
-            show(await api.snapshot(sheetRef.current));
-          } catch (e) {
-            fail(e);
-          }
-        }}
         onExport={async () => {
           if (!view) return;
           const path = await saveDialog({
@@ -265,11 +323,20 @@ export default function App() {
         }}
         onUndo={() => run(api.undo(sheetRef.current))}
         onRedo={() => run(api.redo(sheetRef.current))}
+        onInsertRow={insertRowAbove}
+        onToggleSection={toggleSection}
       />
 
       <main className="grid-area">
         {view ? (
-          <CostGrid view={view} apply={apply} selection={selection} setSelection={setSelection} dark={dark} />
+          <SheetGrid
+            view={view}
+            apply={apply}
+            selection={selection}
+            setSelection={setSelection}
+            onEditColumn={openColumnEditor}
+            dark={dark}
+          />
         ) : (
           <div className="empty">No sheets. Add one below.</div>
         )}
@@ -285,13 +352,63 @@ export default function App() {
           void run(api.snapshot(id));
         }}
         onApply={apply}
-        onAdd={async () => {
-          const id = newId();
-          const n = snap.sheets.length + 1;
+        onAdd={async (template) => {
           setSelection(emptySelection);
-          await run(api.apply({ op: "create_sheet", sheet_id: id, name: `Sheet ${n}` }, id));
+          await run(api.createSheet(template === "spending" ? "Spending" : `Sheet ${snap.sheets.length + 1}`, template));
         }}
       />
+
+      {editing && view && (
+        <ColumnEditor
+          key={editing.mode === "edit" ? editedColumn?.col_id : `new-${editing.position}`}
+          column={editedColumn}
+          otherNames={view.columns.filter((c) => c !== editedColumn).map((c) => c.name)}
+          at={editing.at}
+          onClose={() => setEditing(null)}
+          onSave={async (spec: ColumnSpec) => {
+            const op: Op =
+              editing.mode === "edit" && editedColumn
+                ? { op: "update_column", sheet_id: view.sheet_id, col_id: editedColumn.col_id, spec }
+                : {
+                    op: "add_column",
+                    sheet_id: view.sheet_id,
+                    col_id: newId(),
+                    position: editing.mode === "new" ? editing.position : 0,
+                    spec,
+                  };
+            if (await apply(op)) setEditing(null);
+          }}
+          onInsert={
+            editedColumn && editing.mode === "edit"
+              ? (side) => {
+                  const i = editing.index;
+                  const cols = view.columns;
+                  const position =
+                    side === "left"
+                      ? positionBetween(cols[i - 1]?.position, cols[i].position)
+                      : positionBetween(cols[i].position, cols[i + 1]?.position);
+                  setEditing({ mode: "new", position, at: editing.at });
+                }
+              : undefined
+          }
+          onDelete={
+            editedColumn
+              ? async () => {
+                  const ok = await apply({
+                    op: "set_column_deleted",
+                    sheet_id: view.sheet_id,
+                    col_id: editedColumn.col_id,
+                    deleted: true,
+                  });
+                  if (ok) {
+                    setEditing(null);
+                    setMessage({ text: `Deleted column ${editedColumn.name}. ⌘Z brings it back.` });
+                  }
+                }
+              : undefined
+          }
+        />
+      )}
 
       {(message || snap.notices.length > 0) && (
         <div className={`toast ${message?.error ? "error" : ""}`} onClick={() => setMessage(null)}>
@@ -312,30 +429,19 @@ function TopBar(props: {
   onApply: (op: Op) => void;
   onRefreshRates: () => void;
   onImportRates: () => void;
-  onAddRate: (base: string, quote: string, rate: string, date: string) => void;
   onExport: () => void;
   onUndo: () => void;
   onRedo: () => void;
+  onInsertRow: () => void;
+  onToggleSection: () => void;
 }) {
   const { snap } = props;
   const view = snap.sheet;
   const [newProject, setNewProject] = useState<string | null>(null);
-  const [currencies, setCurrencies] = useState("");
-  const [showRateForm, setShowRateForm] = useState(false);
-
-  useEffect(() => setCurrencies(view ? view.currencies.join(", ") : ""), [view?.sheet_id, view?.currencies.join()]);
-
-  const commitCurrencies = () => {
-    if (!view) return;
-    const codes = currencies
-      .split(/[\s,;]+/)
-      .map((c) => c.trim().toUpperCase())
-      .filter(Boolean);
-    if (codes.join() === view.currencies.join()) return;
-    props.onApply({ op: "set_sheet_currencies", sheet_id: view.sheet_id, currencies: codes });
-  };
+  const [showFixed, setShowFixed] = useState(false);
 
   const locked = view?.rates.mode === "locked" ? view.rates.date : null;
+  const firstSource = view?.effective_sources[0] ?? "ecb";
 
   return (
     <header className="topbar">
@@ -369,23 +475,29 @@ function TopBar(props: {
             onBlur={() => setNewProject(null)}
           />
         )}
+        <button onClick={props.onInsertRow} title="Insert a row above the selection (⌘Enter)">
+          Insert row
+        </button>
+        <button onClick={props.onToggleSection} title="Make the selected row a section heading, or back (⇧⌘S)">
+          Section
+        </button>
       </div>
 
       {view && (
         <div className="group">
           <label className="field">
-            <span>Show in</span>
-            <input
-              className="currencies"
-              value={currencies}
-              onChange={(e) => setCurrencies(e.target.value)}
-              onBlur={commitCurrencies}
-              onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
-              title="Display currencies, e.g. GBP, UAH. Leave empty for the project default."
-            />
-          </label>
-          <label className="field">
             <span>Rates</span>
+            <select
+              value={firstSource}
+              title="Preferred source; others fill gaps (ECB has no hryvnia, so NBU covers UAH)"
+              onChange={(e) =>
+                props.onApply({ op: "set_sheet_sources", sheet_id: view.sheet_id, sources: [e.target.value as RateSource] })
+              }
+            >
+              <option value="ecb">ECB</option>
+              <option value="nbu">NBU</option>
+              <option value="hmrc_monthly">HMRC monthly</option>
+            </select>
             <select
               value={locked ? "locked" : "live"}
               onChange={(e) =>
@@ -405,14 +517,13 @@ function TopBar(props: {
                 value={locked}
                 onChange={(e) =>
                   e.target.value &&
-                  props.onApply({
-                    op: "set_sheet_rates",
-                    sheet_id: view.sheet_id,
-                    rates: { mode: "locked", date: e.target.value },
-                  })
+                  props.onApply({ op: "set_sheet_rates", sheet_id: view.sheet_id, rates: { mode: "locked", date: e.target.value } })
                 }
               />
             )}
+            <button onClick={() => setShowFixed((s) => !s)} className={view.fixed_rates.length ? "on" : ""}>
+              {view.fixed_rates.length ? `Fixed: ${view.fixed_rates.map((r) => `${r.base}=${r.rate}${r.quote}`).join(", ")}` : "Fixed rate…"}
+            </button>
           </label>
         </div>
       )}
@@ -420,13 +531,12 @@ function TopBar(props: {
       <div className="group rates" title="Latest rates held, per source">
         {snap.rate_status.map((r) => (
           <span key={r.source} className={r.latest ? "" : "missing"}>
-            {r.label} {r.source === "hmrc_monthly" && r.latest ? r.latest.slice(0, 7) : shortDate(r.latest)}
+            {SOURCE_LABEL[r.source]} {r.source === "hmrc_monthly" && r.latest ? r.latest.slice(0, 7) : shortDate(r.latest)}
           </span>
         ))}
         <button onClick={props.onRefreshRates} disabled={props.rateBusy}>
           {props.rateBusy ? "Updating…" : "Update rates"}
         </button>
-        <button onClick={() => setShowRateForm((s) => !s)}>Add rate</button>
         <button onClick={props.onImportRates}>Import…</button>
       </div>
 
@@ -442,38 +552,45 @@ function TopBar(props: {
         </button>
       </div>
 
-      {showRateForm && (
-        <RateForm
-          onCancel={() => setShowRateForm(false)}
-          onSave={(b, q, r, d) => {
-            props.onAddRate(b, q, r, d);
-            setShowRateForm(false);
+      {showFixed && view && (
+        <FixedRates
+          rates={view.fixed_rates}
+          onSave={(rates) => {
+            props.onApply({ op: "set_sheet_fixed_rates", sheet_id: view.sheet_id, rates });
+            setShowFixed(false);
           }}
+          onCancel={() => setShowFixed(false)}
         />
       )}
     </header>
   );
 }
 
-function RateForm(props: { onSave: (b: string, q: string, r: string, d: string) => void; onCancel: () => void }) {
-  const [base, setBase] = useState("GBP");
-  const [quote, setQuote] = useState("UAH");
-  const [rate, setRate] = useState("");
-  const [date, setDate] = useState(todayIso());
+/** Hand-set rates for this sheet; they win over every source (like a fixed 44.92 UAH per USD). */
+function FixedRates(props: { rates: FixedRate[]; onSave: (r: FixedRate[]) => void; onCancel: () => void }) {
+  const [rows, setRows] = useState<FixedRate[]>(props.rates.length ? props.rates : [{ base: "USD", quote: "UAH", rate: "" }]);
+  const set = (i: number, patch: Partial<FixedRate>) => setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   return (
     <form
       className="rate-form"
       onSubmit={(e) => {
         e.preventDefault();
-        if (rate.trim()) props.onSave(base, quote, rate, date);
+        props.onSave(rows.filter((r) => r.rate.trim()).map((r) => ({ ...r, base: r.base.toUpperCase(), quote: r.quote.toUpperCase() })));
       }}
     >
-      1 <input value={base} onChange={(e) => setBase(e.target.value)} size={4} /> =
-      <input autoFocus value={rate} onChange={(e) => setRate(e.target.value)} placeholder="rate" size={10} />
-      <input value={quote} onChange={(e) => setQuote(e.target.value)} size={4} /> from
-      <input type="date" value={date} onChange={(e) => setDate(e.target.value)} />
+      <span>Fixed rates for this sheet (empty rate removes it):</span>
+      {rows.map((r, i) => (
+        <span key={i} className="fixed-row">
+          1 <input value={r.base} onChange={(e) => set(i, { base: e.target.value })} size={4} /> =
+          <input autoFocus={i === 0} value={r.rate} onChange={(e) => set(i, { rate: e.target.value })} placeholder="44.92" size={9} />
+          <input value={r.quote} onChange={(e) => set(i, { quote: e.target.value })} size={4} />
+        </span>
+      ))}
+      <button type="button" onClick={() => setRows((rs) => [...rs, { base: "EUR", quote: "UAH", rate: "" }])}>
+        + pair
+      </button>
       <button type="submit" className="primary">
-        Add
+        Save
       </button>
       <button type="button" onClick={props.onCancel}>
         Cancel
@@ -484,27 +601,26 @@ function RateForm(props: { onSave: (b: string, q: string, r: string, d: string) 
 
 // ------------------------------------------------------------------ totals
 
-function Totals({ view }: { view: NonNullable<Snapshot["sheet"]> }) {
+function Totals({ view }: { view: SheetView }) {
   const mode = view.rates.mode === "live" ? `Live rates, ${shortDate(view.as_of)}` : `Rates locked at ${shortDate(view.as_of)}`;
+  const totals = view.columns.map((c, i) => ({ c, t: view.totals[i] })).filter((x) => x.t);
   return (
     <section className="totals">
       <div className="big">
-        {view.totals.map((t) => (
-          <div key={t.currency} className={`total ${t.complete ? "" : "incomplete"}`}>
-            <span className="label">Total {t.currency}</span>
-            <span className="amount">{money(t.amount, t.currency)}</span>
-            {!t.complete && <span className="flag">incomplete</span>}
+        {totals.map(({ c, t }) => (
+          <div key={c.col_id} className={`total ${t!.complete ? "" : "incomplete"}`}>
+            <span className="label">{c.name}</span>
+            <span className="amount">{t!.currency ? money(t!.amount, t!.currency) : t!.amount}</span>
+            {!t!.complete && <span className="flag">incomplete</span>}
           </div>
         ))}
+        {totals.length === 0 && <div className="hint">Tick “Add up” on a column (click its header) to get totals.</div>}
       </div>
       <div className="detail">
-        {view.subtotals.length > 1 && (
-          <div>By currency: {view.subtotals.map((s) => money(s.amount, s.currency)).join(" · ")}</div>
-        )}
         <div>
           {mode}
           {view.rates_used.length > 0 && ": "}
-          {view.rates_used.map((l) => `1 ${l.from} = ${l.rate} ${l.to} (${l.source === "hmrc_monthly" ? "HMRC" : l.source.toUpperCase()} ${l.date})`).join(" · ")}
+          {view.rates_used.map((l) => `1 ${l.from} = ${l.rate} ${l.to} (${SOURCE_LABEL[l.source]} ${l.date})`).join(" · ")}
         </div>
         {view.warnings.map((w) => (
           <div key={w} className="warning">
@@ -523,10 +639,12 @@ function SheetTabs(props: {
   current: string | null;
   onSelect: (id: string) => void;
   onApply: (op: Op) => void;
-  onAdd: () => void;
+  onAdd: (template: "blank" | "spending") => void;
 }) {
   const [renaming, setRenaming] = useState<string | null>(null);
   const [name, setName] = useState("");
+  // Where the new-sheet menu opens (fixed position: the tab bar scrolls and would clip it).
+  const [adding, setAdding] = useState<{ left: number; bottom: number } | null>(null);
   return (
     <nav className="tabs">
       {props.snap.sheets.map((s) => (
@@ -574,10 +692,46 @@ function SheetTabs(props: {
           )}
         </div>
       ))}
-      <button className="add" onClick={props.onAdd} title="New sheet">
-        +
-      </button>
-      <span className="hint">⌘C/⌘X/⌘V copy, cut, paste · ⇧⌘C/⇧⌘V transposed · ⌘D fill down · ⌘-click opens a link</span>
+      <div className="add-wrap">
+        <button
+          className="add"
+          onClick={(e) => {
+            const r = e.currentTarget.getBoundingClientRect();
+            setAdding((a) => (a ? null : { left: r.left, bottom: window.innerHeight - r.top + 4 }));
+          }}
+          title="New sheet"
+        >
+          +
+        </button>
+        {adding && (
+          <>
+          <div className="backdrop" onClick={() => setAdding(null)} />
+          <div className="add-menu" style={adding}>
+            <button
+              onClick={() => {
+                setAdding(null);
+                props.onAdd("blank");
+              }}
+            >
+              Blank sheet
+              <small>Columns A–E; name and type them as you go</small>
+            </button>
+            <button
+              onClick={() => {
+                setAdding(null);
+                props.onAdd("spending");
+              }}
+            >
+              Spending list
+              <small>Item, Link, Note, UAH, USD, Unit USD, Qty, Total USD</small>
+            </button>
+          </div>
+          </>
+        )}
+      </div>
+      <span className="hint">
+        Click a column header to edit it · ⌘C/⌘X/⌘V · ⇧⌘C/⇧⌘V transposed · ⌘D fill down · ⌘-click opens a link
+      </span>
     </nav>
   );
 }

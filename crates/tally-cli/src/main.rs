@@ -24,7 +24,7 @@ USAGE:
                                      convert using the library (sources: HMRC, NBU, ECB)
   tally projects                     list projects
   tally show <project> [sheet]       print a cost list with totals
-  tally sql <project> <query>        run SQL against a project (tables: sheets, cost_items)
+  tally sql <project> <query>        run SQL against a project; each sheet is a table named after it
   tally export <project> <file.xlsx> [sheet]
                                      export a cost list to Excel
   tally home                         print the Tally folder and this machine's id
@@ -177,7 +177,7 @@ fn projects() -> Res {
     Ok(())
 }
 
-fn cost_list(project: &str, sheet: Option<&str>) -> Result<tally_core::costlist::CostListView, String> {
+fn sheet_view(project: &str, sheet: Option<&str>) -> Result<tally_core::sheet::SheetView, String> {
     let p = open(project)?;
     let sheets = p.sheets(false).map_err(e)?;
     let chosen = match sheet {
@@ -188,38 +188,52 @@ fn cost_list(project: &str, sheet: Option<&str>) -> Result<tally_core::costlist:
         None => sheets.first().ok_or("project has no sheets")?,
     };
     let rates = library()?.rates().map_err(e)?;
-    p.cost_list(&chosen.sheet_id, &rates, today()).map_err(e)
+    p.sheet_view(&chosen.sheet_id, &rates, today()).map_err(e)
 }
 
 fn export(project: &str, file: &str, sheet: Option<&str>) -> Res {
-    let v = cost_list(project, sheet)?;
+    let v = sheet_view(project, sheet)?;
     tally_core::export::export_xlsx(&v, std::path::Path::new(file)).map_err(e)?;
     println!("wrote {file}");
     Ok(())
 }
 
 fn show(project: &str, sheet: Option<&str>) -> Res {
-    let v = cost_list(project, sheet)?;
-
-    println!("{}  (rates as of {})", v.name, v.as_of);
-    let heads: Vec<String> = v.currencies.iter().map(|c| c.to_string()).collect();
-    println!("{:<34} {:>6} {:>14} {:>4}  {}", "Item", "Qty", "Unit price", "Cur", heads.iter().map(|h| format!("{h:>14}")).collect::<String>());
+    use tally_core::RowKind;
+    let v = sheet_view(project, sheet)?;
+    println!("{}  (rates as of {})\n", v.name, v.as_of);
+    let width = |j: usize| if j == 0 { 30 } else { 14 };
+    let fit = |s: &str, w: usize| s.chars().take(w).collect::<String>();
+    let head: Vec<String> = v.columns.iter().enumerate().map(|(j, c)| format!("{:<w$}", fit(&format!("{} {}", c.letter, c.name), width(j)), w = width(j))).collect();
+    println!("{}", head.join(" "));
     for r in &v.rows {
-        let conv: String = r.converted.iter().map(|c| format!("{:>14}", c.as_deref().unwrap_or("?"))).collect();
-        println!(
-            "{:<34} {:>6} {:>14} {:>4}  {conv}",
-            r.item.as_deref().unwrap_or("").chars().take(34).collect::<String>(),
-            r.qty.as_deref().unwrap_or(""),
-            r.unit_price.as_deref().unwrap_or(""),
-            r.currency.as_deref().unwrap_or(""),
-        );
+        let cells: Vec<String> = r
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(j, c)| {
+                let text = c.raw.clone().or_else(|| c.value.clone()).or_else(|| c.error.as_ref().map(|_| "!".to_string())).unwrap_or_default();
+                let text = if r.kind == RowKind::Section { text.to_uppercase() } else { text };
+                format!("{:<w$}", fit(&text, width(j)), w = width(j))
+            })
+            .collect();
+        println!("{}", cells.join(" "));
     }
-    let totals: String = v
+    let totals: Vec<String> = v
         .totals
         .iter()
-        .map(|t| format!("{:>14}", if t.complete { t.amount.clone() } else { format!("{}*", t.amount) }))
+        .enumerate()
+        .map(|(j, t)| {
+            let s = match t {
+                Some(t) if t.complete => t.amount.clone(),
+                Some(t) => format!("{}*", t.amount),
+                None if j == 0 => "TOTAL".into(),
+                None => String::new(),
+            };
+            format!("{:<w$}", s, w = width(j))
+        })
         .collect();
-    println!("{:<63}  {totals}", "Total");
+    println!("{}", totals.join(" "));
     for leg in &v.rates_used {
         println!("  1 {} = {} {}  ({}, {})", leg.from, leg.rate, leg.to, leg.source, leg.date);
     }
@@ -231,6 +245,9 @@ fn show(project: &str, sheet: Option<&str>) -> Res {
 
 fn sql(project: &str, query: &str) -> Res {
     let p = open(project)?;
+    // Each sheet becomes a table named after it, with calculated values included.
+    let rates = library()?.rates().map_err(e)?;
+    p.materialize(&rates, today()).map_err(e)?;
     let mut stmt = p.connection().prepare(query).map_err(e)?;
     let mut out: Vec<Vec<String>> = Vec::new();
     {

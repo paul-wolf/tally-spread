@@ -7,12 +7,13 @@ use std::sync::Mutex;
 
 use chrono::{Local, NaiveDate};
 use serde::Serialize;
-use tally_core::costlist::CostListView;
 use tally_core::fx::sources::{self, fetch};
 use tally_core::fx::{RateRecord, RateSource, RateTable};
 use tally_core::home::{machine_id, tally_home};
 use tally_core::library::Library;
-use tally_core::project::SheetInfo;
+use tally_core::project::{read_settings, SheetInfo, FORMAT};
+use tally_core::sheet::SheetView;
+use tally_core::{formula, templates};
 use tally_core::{Currency, Op, Project, ProjectSettings};
 use tauri::State;
 
@@ -54,7 +55,7 @@ pub struct Snapshot {
     pub project: String,
     pub settings: ProjectSettings,
     pub sheets: Vec<SheetInfo>,
-    pub sheet: Option<CostListView>,
+    pub sheet: Option<SheetView>,
     pub can_undo: bool,
     pub can_redo: bool,
     pub rate_status: Vec<RateStatus>,
@@ -80,8 +81,11 @@ fn list_projects(home: &Path) -> Vec<ProjectSummary> {
     if let Ok(entries) = fs::read_dir(projects_dir(home)) {
         for e in entries.flatten() {
             let path = e.path();
-            let Ok(text) = fs::read_to_string(path.join("project.json")) else { continue };
-            let Ok(settings) = serde_json::from_str::<ProjectSettings>(&text) else { continue };
+            // Projects from an earlier version of Tally cannot be opened; skip them.
+            let Ok(settings) = read_settings(&path) else { continue };
+            if settings.format < FORMAT {
+                continue;
+            }
             out.push(ProjectSummary { dir_name: e.file_name().to_string_lossy().into_owned(), name: settings.name });
         }
     }
@@ -99,13 +103,11 @@ fn slug(name: &str) -> String {
     if s.is_empty() { "project".into() } else { s }
 }
 
-/// Settings for a new project. The first-run defaults suit buying in Ukraine and
-/// keeping records in the UK; change them per project in `project.json`.
+/// Settings for a new project: ECB rates first, NBU for hryvnia (which ECB does
+/// not publish), UK as tax home. Change them per project in `project.json`.
 fn default_settings(name: &str) -> ProjectSettings {
-    let gbp = Currency::new("GBP").unwrap();
-    let mut s = ProjectSettings::new(name, gbp.clone());
-    s.display_currencies = vec![gbp, Currency::new("UAH").unwrap()];
-    s.rate_sources = vec![RateSource::HmrcMonthly, RateSource::Nbu, RateSource::Ecb, RateSource::Manual];
+    let mut s = ProjectSettings::new(name, Currency::new("GBP").unwrap());
+    s.rate_sources = vec![RateSource::Ecb, RateSource::Nbu, RateSource::HmrcMonthly, RateSource::Manual];
     s.tax_home = Some("GB".into());
     s
 }
@@ -120,7 +122,8 @@ fn create_project_in(home: &Path, name: &str, machine: &str) -> Result<(Project,
     }
     let dir = projects_dir(home).join(&dir_name);
     let mut p = Project::create(&dir, default_settings(name), machine).map_err(err)?;
-    p.apply(Op::CreateSheet { sheet_id: Op::new_id(), name: "Cost list".into() }).map_err(err)?;
+    let ops = templates::sheet_ops("spending", &Op::new_id(), "Spending");
+    p.apply(Op::Batch { ops }).map_err(err)?;
     // Reopen so the first sheet is not on the undo stack.
     let p = Project::open(&dir, machine).map_err(err)?;
     Ok((p, dir_name))
@@ -140,7 +143,7 @@ fn init() -> Result<Inner, String> {
         .or_else(|| existing.first().map(|p| p.dir_name.clone()))
     {
         Some(dir) => (Project::open(projects_dir(&home).join(&dir), &machine).map_err(err)?, dir),
-        None => create_project_in(&home, "My costs", &machine)?,
+        None => create_project_in(&home, "My project", &machine)?,
     };
     Ok(Inner { home, machine, library, rates, project, project_dir_name })
 }
@@ -158,7 +161,7 @@ impl Inner {
             .filter(|id| sheets.iter().any(|s| s.sheet_id == *id))
             .or_else(|| sheets.first().map(|s| s.sheet_id.as_str()));
         let sheet = match chosen {
-            Some(id) => Some(self.project.cost_list(id, &self.rates, today()).map_err(err)?),
+            Some(id) => Some(self.project.sheet_view(id, &self.rates, today()).map_err(err)?),
             None => None,
         };
         let mut notices = notices;
@@ -316,10 +319,25 @@ fn add_manual_rate(state: State<AppState>, base: String, quote: String, rate: St
     Ok(added)
 }
 
+/// Create a sheet from a template ("blank" or "spending").
+#[tauri::command]
+fn create_sheet(state: State<AppState>, name: String, template: String) -> CmdResult<Snapshot> {
+    let mut inner = state.0.lock().map_err(err)?;
+    let id = Op::new_id();
+    inner.project.apply(Op::Batch { ops: templates::sheet_ops(&template, &id, &name) }).map_err(err)?;
+    inner.snapshot(Some(&id), vec![])
+}
+
+/// Check a column formula as it is typed: `None` if it parses, else the problem.
+#[tauri::command]
+fn check_formula(formula: String) -> Option<String> {
+    formula::parse(&formula).err()
+}
+
 #[tauri::command]
 fn export_xlsx(state: State<AppState>, sheet_id: String, path: String) -> CmdResult<()> {
     let inner = state.0.lock().map_err(err)?;
-    let view = inner.project.cost_list(&sheet_id, &inner.rates, today()).map_err(err)?;
+    let view = inner.project.sheet_view(&sheet_id, &inner.rates, today()).map_err(err)?;
     tally_core::export::export_xlsx(&view, Path::new(&path)).map_err(err)
 }
 
@@ -343,6 +361,8 @@ pub fn run() {
             refresh_rates,
             import_rates,
             add_manual_rate,
+            create_sheet,
+            check_formula,
             export_xlsx
         ])
         .run(tauri::generate_context!())

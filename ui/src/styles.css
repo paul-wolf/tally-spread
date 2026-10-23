@@ -135,3 +135,67 @@ input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accen
   cursor: pointer;
 }
 .toast.error { background: var(--error); color: #fff; }
+
+/* ---- columns, sections, menus ---- */
+.add-column {
+  height: 100%;
+  min-height: 52px;
+  width: 40px;
+  border: none;
+  border-left: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 18px;
+}
+.add-column:hover { color: var(--text); }
+
+.backdrop { position: fixed; inset: 0; z-index: 50; }
+.column-editor {
+  position: fixed;
+  z-index: 51;
+  width: 360px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.2);
+}
+.column-editor label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12px; }
+.column-editor label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--text); font-size: 13px; }
+.column-editor input:not([type]) , .column-editor input[type="text"] { font-size: 13px; color: var(--text); }
+.column-editor .bad { border-color: var(--error); }
+.ce-title { font-weight: 600; }
+.kinds { display: flex; flex-wrap: wrap; gap: 4px; }
+.kinds button.on, .topbar button.on { background: var(--accent); color: var(--accent-text); border-color: transparent; }
+.ce-error { color: var(--error); font-size: 12px; }
+.ce-names { display: flex; flex-wrap: wrap; gap: 4px; }
+.ce-names button { font-size: 12px; padding: 2px 7px; }
+.ce-help { color: var(--muted); font-size: 11.5px; line-height: 1.6; }
+.ce-help code { font-size: 11.5px; }
+.ce-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.ce-actions .spacer { flex: 1; }
+button.danger { color: var(--error); }
+
+.add-wrap { position: relative; display: flex; }
+.add-menu {
+  position: fixed;
+  z-index: 51;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  width: 300px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+}
+.add-menu button { text-align: left; display: flex; flex-direction: column; gap: 2px; border: none; }
+.add-menu button:hover { background: var(--bg); }
+.add-menu small { color: var(--muted); font-size: 11px; }
+.fixed-row { display: inline-flex; align-items: center; gap: 4px; }
+.totals .hint { color: var(--muted); font-size: 12px; }

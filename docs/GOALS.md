@@ -2,7 +2,7 @@
 
 Check every proposal and design against these goals and flag any conflict.
 
-1. **Be fast for everyday money work.** Summing columns, calculations across columns and cross tabs in a fluid, keyboard-first interface, with excellent copy, paste and transpose, including clean pasting to and from Excel.
+1. **Be fast for everyday money work.** Summing columns, calculations across columns and cross tabs in a fluid, keyboard-first interface, with excellent copy, paste and transpose, including clean pasting to and from Excel. Sheets have the user's own columns, not a fixed layout.
 2. **Get multi-currency right.** Currency is a built-in part of every amount, all arithmetic uses exact decimals, and conversions are explicit, with known rates and dates, so different currencies are never silently added together.
 3. **Make AI a first-class way to work.** Plain-language requests become visible, undoable operations; the engine does all the math. Routine actions stay cheap through a local command parser, reusable recipes, a small default model and a budget cap.
 4. **Keep the data open through an existing engine.** DuckDB stores the data, so SQL, Python, pandas, Polars, Arrow and an MCP server for agents all work without building custom interfaces.
@@ -14,9 +14,17 @@ Check every proposal and design against these goals and flag any conflict.
 
 **Deliberately out of scope:** building a formula engine, full Excel compatibility, charts and macros.
 
+## Sheet model (decided 2026-10-23)
+
+- **Flexible columns.** Columns are lettered A, B, C… like Excel and named per sheet; they can be inserted, deleted, moved, renamed and retyped at any time. Types: text, number, link, money in one currency (e.g. separate "UAH" and "USD" price columns), calculated.
+- **Calculated columns, not cell formulas.** One formula per column (e.g. `coalesce(to(UAH, USD), USD)`, `[Unit USD] * Qty`), evaluated with exact decimals; literal values and formulas never mix in one column. Free-form per-cell formulas are not planned; if they turn out to be needed, embed IronCalc rather than write an engine.
+- **Sections with subtotals** replace blank-row groups and hand-built subtotal cells.
+- **Rates:** the user chooses the provider per sheet; ECB preferred. ECB does not publish UAH, so NBU fills that gap automatically. Fixed hand-set rates per sheet (e.g. 1 USD = 44.92 UAH) win over every source.
+- **Typical spending layout:** Item | Link | Note | UAH | USD | Unit USD (calc) | Qty | Total USD (calc, totalled). Spending lists of this kind are in USD and unrelated to tax; the GBP/HMRC setup applies to tax work only.
+
 ## Primary use case and first milestone: cost lists
 
-The most frequent task is writing lists of things that cost money, often with product URLs, priced in one or more currencies and shown in one or more display currencies. The first milestone centres on this: mixed-currency rows, multiple display currencies with totals, paste a product link to fill in name/price/currency, exchange rates fetched daily and managed automatically (live or locked to a date), and PDF/XLSX export with clickable links.
+The most frequent task is writing lists of things that cost money, often with product URLs, priced in one or more currencies and shown in one or more display currencies. Done so far: user-defined columns, calculated columns, sections, rates fetched and managed automatically (live, locked to a date, or fixed), paste from Excel, XLSX export. Still to do in this milestone: paste a product link to fill in name/price/currency, PDF export.
 
 ## Key feature: cross-border purchases and tax records
 
@@ -31,3 +39,5 @@ Purchases are made mainly in Ukraine (UAH, prices normally include Ukrainian VAT
 - **Taxes** are reference data: rates by country, category and date; each row knows tax-inclusive or exclusive and its rate; net, tax and gross shown in every display currency; tax computed in original currency, then converted.
 
 Full design doc: https://claude.ai/artifact/QQdXFgm7XTf5iW4VcSS8N9
+
+Code repository: https://github.com/paul-wolf/tally-spread (local clone: ~/prj/tally on the Mac, branch main); docs/GOALS.md there mirrors this file. Product name: Tally; package/repo identifier: tally-spread.

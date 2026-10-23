@@ -1,4 +1,4 @@
-//! A project: one area of work (e.g. "Office fit-out") with its own sheets and
+//! A project: one area of work (e.g. "Drone build") with its own sheets and
 //! settings. On disk it is a folder:
 //!
 //! ```text
@@ -11,11 +11,14 @@
 //! the logs, so the logs are the only thing that needs syncing or backing up.
 //! Each machine writes only its own log file, so file sync never has two machines
 //! writing the same file.
+//!
+//! Sheets have user-defined columns (see [`ColumnKind`]); values are stored per
+//! cell, normalised for the column's type.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use chrono::Utc;
 use duckdb::{params, Connection, OptionalExt};
@@ -23,19 +26,23 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::formula;
 use crate::fx::RateSource;
 use crate::money::{parse_amount, Currency, Rounding, RoundingScope};
-use crate::ops::{Column, LogEntry, Op, RateMode};
+use crate::ops::{ColumnKind, ColumnSpec, FixedRate, LogEntry, Op, RateMode, RowKind};
 use crate::{Error, Result};
+
+/// Version of the project format. Projects made by an older version cannot be opened.
+pub const FORMAT: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ProjectSettings {
+    #[serde(default)]
+    pub format: u32,
     pub name: String,
     /// The currency the records are kept in (e.g. GBP for UK tax).
     pub reporting_currency: Currency,
-    /// Default display currencies for new sheets.
-    pub display_currencies: Vec<Currency>,
-    /// Rate sources in order of preference.
+    /// Rate sources in order of preference; a sheet can choose its own.
     pub rate_sources: Vec<RateSource>,
     #[serde(default)]
     pub rounding: Rounding,
@@ -52,8 +59,8 @@ pub struct ProjectSettings {
 impl ProjectSettings {
     pub fn new(name: &str, reporting: Currency) -> Self {
         Self {
+            format: FORMAT,
             name: name.to_string(),
-            display_currencies: vec![reporting.clone()],
             reporting_currency: reporting,
             rate_sources: vec![RateSource::Ecb, RateSource::Nbu, RateSource::HmrcMonthly, RateSource::Manual],
             rounding: Rounding::default(),
@@ -69,21 +76,25 @@ pub struct SheetInfo {
     pub sheet_id: String,
     pub name: String,
     pub archived: bool,
-    /// Display currencies set on the sheet (empty = project default).
-    pub currencies: Vec<Currency>,
     pub rates: RateMode,
+    /// Rate sources chosen for this sheet (empty = the project's).
+    pub sources: Vec<RateSource>,
+    pub fixed_rates: Vec<FixedRate>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct CostRow {
+pub struct ColumnInfo {
+    pub col_id: String,
+    pub position: f64,
+    #[serde(flatten)]
+    pub spec: ColumnSpec,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct RowInfo {
     pub row_id: String,
     pub position: f64,
-    pub item: Option<String>,
-    pub url: Option<String>,
-    pub qty: Option<Decimal>,
-    pub unit_price: Option<Decimal>,
-    pub currency: Option<Currency>,
-    pub note: Option<String>,
+    pub kind: RowKind,
 }
 
 const SCHEMA: &str = "
@@ -92,20 +103,30 @@ CREATE TABLE sheets (
     name VARCHAR NOT NULL,
     position INTEGER NOT NULL,
     archived BOOLEAN NOT NULL DEFAULT false,
-    currencies VARCHAR NOT NULL DEFAULT '',
-    rates VARCHAR NOT NULL DEFAULT 'live'
+    rates VARCHAR NOT NULL DEFAULT 'live',
+    sources VARCHAR NOT NULL DEFAULT '[]',
+    fixed_rates VARCHAR NOT NULL DEFAULT '[]'
 );
-CREATE TABLE cost_items (
+CREATE TABLE columns (
+    sheet_id VARCHAR NOT NULL,
+    col_id VARCHAR NOT NULL,
+    position DOUBLE NOT NULL,
+    name VARCHAR NOT NULL,
+    spec VARCHAR NOT NULL,
+    deleted BOOLEAN NOT NULL DEFAULT false
+);
+CREATE TABLE sheet_rows (
     sheet_id VARCHAR NOT NULL,
     row_id VARCHAR NOT NULL,
     position DOUBLE NOT NULL,
-    item VARCHAR,
-    url VARCHAR,
-    qty DECIMAL(28, 8),
-    unit_price DECIMAL(28, 8),
-    currency VARCHAR,
-    note VARCHAR,
+    kind VARCHAR NOT NULL DEFAULT 'item',
     deleted BOOLEAN NOT NULL DEFAULT false
+);
+CREATE TABLE cells (
+    sheet_id VARCHAR NOT NULL,
+    row_id VARCHAR NOT NULL,
+    col_id VARCHAR NOT NULL,
+    value VARCHAR NOT NULL
 );
 ";
 
@@ -122,13 +143,19 @@ pub struct Project {
     replay_warnings: Vec<String>,
 }
 
+/// Read a project's settings without opening it.
+pub fn read_settings(dir: &Path) -> Result<ProjectSettings> {
+    Ok(serde_json::from_str(&fs::read_to_string(dir.join("project.json"))?)?)
+}
+
 impl Project {
     /// Create a new project folder.
-    pub fn create(dir: impl Into<PathBuf>, settings: ProjectSettings, machine: &str) -> Result<Self> {
+    pub fn create(dir: impl Into<PathBuf>, mut settings: ProjectSettings, machine: &str) -> Result<Self> {
         let dir = dir.into();
         if dir.join("project.json").exists() {
             return Err(Error::InvalidValue(format!("a project already exists in {}", dir.display())));
         }
+        settings.format = FORMAT;
         fs::create_dir_all(dir.join("ops"))?;
         fs::write(dir.join("project.json"), serde_json::to_string_pretty(&settings)?)?;
         Self::open(dir, machine)
@@ -137,7 +164,13 @@ impl Project {
     /// Open a project folder and replay its logs.
     pub fn open(dir: impl Into<PathBuf>, machine: &str) -> Result<Self> {
         let dir = dir.into();
-        let settings: ProjectSettings = serde_json::from_str(&fs::read_to_string(dir.join("project.json"))?)?;
+        let settings = read_settings(&dir)?;
+        if settings.format < FORMAT {
+            return Err(Error::InvalidValue(format!(
+                "{} was made by an earlier version of Tally and cannot be opened",
+                dir.display()
+            )));
+        }
         fs::create_dir_all(dir.join("ops"))?;
         let mut p = Self {
             dir,
@@ -162,13 +195,14 @@ impl Project {
         &self.settings
     }
 
-    pub fn save_settings(&mut self, settings: ProjectSettings) -> Result<()> {
+    pub fn save_settings(&mut self, mut settings: ProjectSettings) -> Result<()> {
+        settings.format = FORMAT;
         fs::write(self.dir.join("project.json"), serde_json::to_string_pretty(&settings)?)?;
         self.settings = settings;
         Ok(())
     }
 
-    /// The project's DuckDB connection, for SQL queries over `sheets` and `cost_items`.
+    /// The project's DuckDB connection (tables: sheets, columns, sheet_rows, cells).
     pub fn connection(&self) -> &Connection {
         &self.conn
     }
@@ -231,7 +265,10 @@ impl Project {
     }
 
     fn rebuild(&mut self) -> Result<()> {
-        self.conn.execute_batch("DROP TABLE IF EXISTS sheets; DROP TABLE IF EXISTS cost_items;")?;
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS sheets; DROP TABLE IF EXISTS columns;
+             DROP TABLE IF EXISTS sheet_rows; DROP TABLE IF EXISTS cells;",
+        )?;
         self.conn.execute_batch(SCHEMA)?;
         let (entries, unreadable) = self.read_log()?;
         self.replay_warnings = unreadable;
@@ -311,8 +348,7 @@ impl Project {
                 if self.sheet_exists(sheet_id)? {
                     return Err(Error::InvalidValue(format!("sheet {sheet_id} already exists")));
                 }
-                let position: i64 =
-                    self.conn.query_row("SELECT count(*) FROM sheets", [], |r| r.get(0))?;
+                let position: i64 = self.conn.query_row("SELECT count(*) FROM sheets", [], |r| r.get(0))?;
                 self.conn.execute(
                     "INSERT INTO sheets (sheet_id, name, position) VALUES (?, ?, ?)",
                     params![sheet_id, name, position],
@@ -333,48 +369,140 @@ impl Project {
             }
             Op::SetSheetArchived { sheet_id, archived } => {
                 let old = self.sheet(sheet_id)?.archived;
-                self.conn.execute(
-                    "UPDATE sheets SET archived = ? WHERE sheet_id = ?",
-                    params![archived, sheet_id],
-                )?;
+                self.conn
+                    .execute("UPDATE sheets SET archived = ? WHERE sheet_id = ?", params![archived, sheet_id])?;
                 Ok((op.clone(), Op::SetSheetArchived { sheet_id: sheet_id.clone(), archived: old }))
-            }
-            Op::SetSheetCurrencies { sheet_id, currencies } => {
-                let old = self.sheet(sheet_id)?.currencies;
-                let mut unique: Vec<Currency> = Vec::new();
-                for c in currencies {
-                    if !unique.contains(c) {
-                        unique.push(c.clone());
-                    }
-                }
-                let joined = unique.iter().map(|c| c.code()).collect::<Vec<_>>().join(",");
-                self.conn.execute(
-                    "UPDATE sheets SET currencies = ? WHERE sheet_id = ?",
-                    params![joined, sheet_id],
-                )?;
-                Ok((
-                    Op::SetSheetCurrencies { sheet_id: sheet_id.clone(), currencies: unique },
-                    Op::SetSheetCurrencies { sheet_id: sheet_id.clone(), currencies: old },
-                ))
             }
             Op::SetSheetRates { sheet_id, rates } => {
                 let old = self.sheet(sheet_id)?.rates;
-                self.conn.execute(
-                    "UPDATE sheets SET rates = ? WHERE sheet_id = ?",
-                    params![rates.to_db(), sheet_id],
-                )?;
+                self.conn
+                    .execute("UPDATE sheets SET rates = ? WHERE sheet_id = ?", params![rates.to_db(), sheet_id])?;
                 Ok((op.clone(), Op::SetSheetRates { sheet_id: sheet_id.clone(), rates: old }))
             }
-            Op::InsertRow { sheet_id, row_id, position } => {
-                self.sheet(sheet_id)?;
-                if self.row_exists(sheet_id, row_id)? {
-                    return Err(Error::InvalidValue(format!("row {row_id} already exists")));
-                }
-                if !position.is_finite() {
-                    return Err(Error::InvalidValue("row position must be a number".into()));
+            Op::SetSheetSources { sheet_id, sources } => {
+                let old = self.sheet(sheet_id)?.sources;
+                let mut unique = Vec::new();
+                for s in sources {
+                    if !unique.contains(s) {
+                        unique.push(*s);
+                    }
                 }
                 self.conn.execute(
-                    "INSERT INTO cost_items (sheet_id, row_id, position) VALUES (?, ?, ?)",
+                    "UPDATE sheets SET sources = ? WHERE sheet_id = ?",
+                    params![serde_json::to_string(&unique)?, sheet_id],
+                )?;
+                Ok((
+                    Op::SetSheetSources { sheet_id: sheet_id.clone(), sources: unique },
+                    Op::SetSheetSources { sheet_id: sheet_id.clone(), sources: old },
+                ))
+            }
+            Op::SetSheetFixedRates { sheet_id, rates } => {
+                let old = self.sheet(sheet_id)?.fixed_rates;
+                let mut clean = Vec::new();
+                for r in rates {
+                    let (rate, _) = parse_amount(&r.rate)?;
+                    if rate <= Decimal::ZERO || r.base == r.quote {
+                        return Err(Error::InvalidValue(format!("1 {} = {} {} is not a usable rate", r.base, r.rate, r.quote)));
+                    }
+                    clean.push(FixedRate { base: r.base.clone(), quote: r.quote.clone(), rate: rate.to_string() });
+                }
+                self.conn.execute(
+                    "UPDATE sheets SET fixed_rates = ? WHERE sheet_id = ?",
+                    params![serde_json::to_string(&clean)?, sheet_id],
+                )?;
+                Ok((
+                    Op::SetSheetFixedRates { sheet_id: sheet_id.clone(), rates: clean },
+                    Op::SetSheetFixedRates { sheet_id: sheet_id.clone(), rates: old },
+                ))
+            }
+
+            Op::AddColumn { sheet_id, col_id, position, spec } => {
+                self.sheet(sheet_id)?;
+                if self.column_row(sheet_id, col_id)?.is_some() {
+                    return Err(Error::InvalidValue(format!("column {col_id} already exists")));
+                }
+                finite(*position)?;
+                let spec = self.check_spec(sheet_id, None, spec)?;
+                self.conn.execute(
+                    "INSERT INTO columns (sheet_id, col_id, position, name, spec) VALUES (?, ?, ?, ?, ?)",
+                    params![sheet_id, col_id, position, spec.name, serde_json::to_string(&spec)?],
+                )?;
+                Ok((
+                    Op::AddColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), position: *position, spec },
+                    Op::SetColumnDeleted { sheet_id: sheet_id.clone(), col_id: col_id.clone(), deleted: true },
+                ))
+            }
+            Op::UpdateColumn { sheet_id, col_id, spec } => {
+                let old = self.column(sheet_id, col_id)?;
+                let spec = self.check_spec(sheet_id, Some(col_id), spec)?;
+                self.write_spec(sheet_id, col_id, &spec)?;
+                let mut done = vec![Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), spec: spec.clone() }];
+                let mut undo = vec![Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), spec: old.spec.clone() }];
+
+                // Keep other columns' formulas pointing at this column after a rename.
+                if old.spec.name != spec.name {
+                    for other in self.columns(sheet_id)? {
+                        if other.col_id == *col_id {
+                            continue;
+                        }
+                        if let ColumnKind::Calc { formula: src } = &other.spec.kind {
+                            let Ok(expr) = formula::parse(src) else { continue };
+                            if !formula::names(&expr).iter().any(|n| n.eq_ignore_ascii_case(&old.spec.name)) {
+                                continue;
+                            }
+                            let new_src = formula::rename(&expr, &old.spec.name, &spec.name).to_string();
+                            let new_spec = ColumnSpec { kind: ColumnKind::Calc { formula: new_src }, ..other.spec.clone() };
+                            self.write_spec(sheet_id, &other.col_id, &new_spec)?;
+                            done.push(Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: other.col_id.clone(), spec: new_spec });
+                            undo.push(Op::UpdateColumn { sheet_id: sheet_id.clone(), col_id: other.col_id.clone(), spec: other.spec.clone() });
+                        }
+                    }
+                }
+                undo.reverse();
+                if done.len() == 1 {
+                    Ok((done.pop().unwrap(), undo.pop().unwrap()))
+                } else {
+                    Ok((Op::Batch { ops: done }, Op::Batch { ops: undo }))
+                }
+            }
+            Op::MoveColumn { sheet_id, col_id, position } => {
+                finite(*position)?;
+                let old = self.column(sheet_id, col_id)?.position;
+                self.conn.execute(
+                    "UPDATE columns SET position = ? WHERE sheet_id = ? AND col_id = ?",
+                    params![position, sheet_id, col_id],
+                )?;
+                Ok((op.clone(), Op::MoveColumn { sheet_id: sheet_id.clone(), col_id: col_id.clone(), position: old }))
+            }
+            Op::SetColumnDeleted { sheet_id, col_id, deleted } => {
+                let (_, old) = self
+                    .column_row(sheet_id, col_id)?
+                    .ok_or_else(|| Error::NotFound(format!("column {col_id}")))?;
+                if !deleted && old {
+                    // Restoring: its name must still be free.
+                    let spec = self.column_spec_any(sheet_id, col_id)?;
+                    if self.name_taken(sheet_id, Some(col_id), &spec.name)? {
+                        return Err(Error::InvalidValue(format!("another column is already called {}", spec.name)));
+                    }
+                }
+                self.conn.execute(
+                    "UPDATE columns SET deleted = ? WHERE sheet_id = ? AND col_id = ?",
+                    params![deleted, sheet_id, col_id],
+                )?;
+                Ok((
+                    op.clone(),
+                    Op::SetColumnDeleted { sheet_id: sheet_id.clone(), col_id: col_id.clone(), deleted: old },
+                ))
+            }
+
+            Op::InsertRow { sheet_id, row_id, position } => {
+                self.sheet(sheet_id)?;
+                if self.row_state(sheet_id, row_id)?.is_some() {
+                    return Err(Error::InvalidValue(format!("row {row_id} already exists")));
+                }
+                finite(*position)?;
+                self.conn.execute(
+                    "INSERT INTO sheet_rows (sheet_id, row_id, position) VALUES (?, ?, ?)",
                     params![sheet_id, row_id, position],
                 )?;
                 Ok((
@@ -382,18 +510,18 @@ impl Project {
                     Op::SetRowDeleted { sheet_id: sheet_id.clone(), row_id: row_id.clone(), deleted: true },
                 ))
             }
-            Op::SetRowDeleted { sheet_id, row_id, deleted } => {
-                let old: bool = self
-                    .conn
-                    .query_row(
-                        "SELECT deleted FROM cost_items WHERE sheet_id = ? AND row_id = ?",
-                        params![sheet_id, row_id],
-                        |r| r.get(0),
-                    )
-                    .optional()?
-                    .ok_or_else(|| Error::NotFound(format!("row {row_id}")))?;
+            Op::SetRowKind { sheet_id, row_id, kind } => {
+                let (old, _) = self.row_state(sheet_id, row_id)?.ok_or_else(|| Error::NotFound(format!("row {row_id}")))?;
                 self.conn.execute(
-                    "UPDATE cost_items SET deleted = ? WHERE sheet_id = ? AND row_id = ?",
+                    "UPDATE sheet_rows SET kind = ? WHERE sheet_id = ? AND row_id = ?",
+                    params![kind.as_str(), sheet_id, row_id],
+                )?;
+                Ok((op.clone(), Op::SetRowKind { sheet_id: sheet_id.clone(), row_id: row_id.clone(), kind: old }))
+            }
+            Op::SetRowDeleted { sheet_id, row_id, deleted } => {
+                let (_, old) = self.row_state(sheet_id, row_id)?.ok_or_else(|| Error::NotFound(format!("row {row_id}")))?;
+                self.conn.execute(
+                    "UPDATE sheet_rows SET deleted = ? WHERE sheet_id = ? AND row_id = ?",
                     params![deleted, sheet_id, row_id],
                 )?;
                 Ok((
@@ -401,8 +529,35 @@ impl Project {
                     Op::SetRowDeleted { sheet_id: sheet_id.clone(), row_id: row_id.clone(), deleted: old },
                 ))
             }
-            Op::SetCell { sheet_id, row_id, column, value } => {
-                self.exec_set_cell(sheet_id, row_id, *column, value.as_deref())
+            Op::SetCell { sheet_id, row_id, col_id, value } => {
+                let (row_kind, _) =
+                    self.row_state(sheet_id, row_id)?.ok_or_else(|| Error::NotFound(format!("row {row_id}")))?;
+                let col = self.column(sheet_id, col_id)?;
+                let old = self.cell(sheet_id, row_id, col_id)?;
+                let value = value.as_deref().map(str::trim).filter(|v| !v.is_empty());
+                let normalized = match value {
+                    None => None,
+                    // A section heading is free text in any column.
+                    Some(v) if row_kind == RowKind::Section => Some(v.to_string()),
+                    Some(v) => Some(normalize_cell(&col.spec, v)?),
+                };
+                self.conn.execute(
+                    "DELETE FROM cells WHERE sheet_id = ? AND row_id = ? AND col_id = ?",
+                    params![sheet_id, row_id, col_id],
+                )?;
+                if let Some(v) = &normalized {
+                    self.conn.execute(
+                        "INSERT INTO cells (sheet_id, row_id, col_id, value) VALUES (?, ?, ?, ?)",
+                        params![sheet_id, row_id, col_id, v],
+                    )?;
+                }
+                let make = |v: Option<String>| Op::SetCell {
+                    sheet_id: sheet_id.clone(),
+                    row_id: row_id.clone(),
+                    col_id: col_id.clone(),
+                    value: v,
+                };
+                Ok((make(normalized), make(old)))
             }
             Op::Batch { ops } => {
                 let mut done = Vec::with_capacity(ops.len());
@@ -418,54 +573,41 @@ impl Project {
         }
     }
 
-    fn exec_set_cell(&self, sheet_id: &str, row_id: &str, column: Column, value: Option<&str>) -> Result<(Op, Op)> {
-        if !self.row_exists(sheet_id, row_id)? {
-            return Err(Error::NotFound(format!("row {row_id}")));
+    /// Validate a column spec; names must be unique (formulas refer to them).
+    fn check_spec(&self, sheet_id: &str, col_id: Option<&str>, spec: &ColumnSpec) -> Result<ColumnSpec> {
+        let name = non_empty(&spec.name, "column name")?;
+        if name.contains(['[', ']']) {
+            return Err(Error::InvalidValue("column names cannot contain [ or ]".into()));
         }
-        let old = self.cell(sheet_id, row_id, column)?;
-        let value = value.map(str::trim).filter(|v| !v.is_empty());
-
-        // An amount typed with a currency ("₴1 200", "£12.50") also sets the row's
-        // currency when it differs.
-        let mut also_currency: Option<Currency> = None;
-        let normalized: Option<String> = match (column, value) {
-            (_, None) => None,
-            (Column::Qty, Some(v)) => Some(parse_amount(v)?.0.to_string()),
-            (Column::UnitPrice, Some(v)) => {
-                let (amount, cur) = parse_amount(v)?;
-                if let Some(cur) = cur {
-                    let row_cur = self.cell(sheet_id, row_id, Column::Currency)?;
-                    if row_cur.as_deref() != Some(cur.code()) {
-                        also_currency = Some(cur);
-                    }
+        if self.name_taken(sheet_id, col_id, &name)? {
+            return Err(Error::InvalidValue(format!("another column is already called {name}")));
+        }
+        let kind = match &spec.kind {
+            ColumnKind::Calc { formula: src } => {
+                let expr = formula::parse(src).map_err(|e| Error::InvalidValue(format!("formula: {e}")))?;
+                if formula::names(&expr).iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                    return Err(Error::InvalidValue(format!("the formula for {name} refers to itself")));
                 }
-                Some(amount.to_string())
+                ColumnKind::Calc { formula: src.trim().trim_start_matches('=').trim().to_string() }
             }
-            (Column::Currency, Some(v)) => Some(Currency::new(v)?.code().to_string()),
-            (Column::Url, Some(v)) => Some(normalize_url(v)),
-            (_, Some(v)) => Some(v.to_string()),
+            other => other.clone(),
         };
+        Ok(ColumnSpec { name, kind, total: spec.total })
+    }
 
-        let sql = if column.is_decimal() {
-            format!(
-                "UPDATE cost_items SET {} = CAST(? AS DECIMAL(28, 8)) WHERE sheet_id = ? AND row_id = ?",
-                column.sql_name()
-            )
-        } else {
-            format!("UPDATE cost_items SET {} = ? WHERE sheet_id = ? AND row_id = ?", column.sql_name())
-        };
-        self.conn.execute(&sql, params![normalized, sheet_id, row_id])?;
+    fn name_taken(&self, sheet_id: &str, col_id: Option<&str>, name: &str) -> Result<bool> {
+        Ok(self
+            .columns(sheet_id)?
+            .iter()
+            .any(|c| Some(c.col_id.as_str()) != col_id && c.spec.name.eq_ignore_ascii_case(name)))
+    }
 
-        let set = Op::SetCell { sheet_id: sheet_id.into(), row_id: row_id.into(), column, value: normalized };
-        let unset = Op::SetCell { sheet_id: sheet_id.into(), row_id: row_id.into(), column, value: old };
-        match also_currency {
-            None => Ok((set, unset)),
-            Some(cur) => {
-                let (cur_set, cur_unset) =
-                    self.exec_set_cell(sheet_id, row_id, Column::Currency, Some(cur.code()))?;
-                Ok((Op::Batch { ops: vec![set, cur_set] }, Op::Batch { ops: vec![cur_unset, unset] }))
-            }
-        }
+    fn write_spec(&self, sheet_id: &str, col_id: &str, spec: &ColumnSpec) -> Result<()> {
+        self.conn.execute(
+            "UPDATE columns SET name = ?, spec = ? WHERE sheet_id = ? AND col_id = ?",
+            params![spec.name, serde_json::to_string(spec)?, sheet_id, col_id],
+        )?;
+        Ok(())
     }
 
     // ---------------------------------------------------------------- reading
@@ -476,25 +618,52 @@ impl Project {
         Ok(n > 0)
     }
 
-    fn row_exists(&self, sheet_id: &str, row_id: &str) -> Result<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT count(*) FROM cost_items WHERE sheet_id = ? AND row_id = ?",
-            params![sheet_id, row_id],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
+    /// (kind, deleted) of a row, if it exists.
+    fn row_state(&self, sheet_id: &str, row_id: &str) -> Result<Option<(RowKind, bool)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT kind, deleted FROM sheet_rows WHERE sheet_id = ? AND row_id = ?",
+                params![sheet_id, row_id],
+                |r| Ok((RowKind::parse(&r.get::<_, String>(0)?), r.get::<_, bool>(1)?)),
+            )
+            .optional()?)
     }
 
-    fn cell(&self, sheet_id: &str, row_id: &str, column: Column) -> Result<Option<String>> {
-        let sql = format!(
-            "SELECT CAST({} AS VARCHAR) FROM cost_items WHERE sheet_id = ? AND row_id = ?",
-            column.sql_name()
-        );
-        let v: Option<String> = self.conn.query_row(&sql, params![sheet_id, row_id], |r| r.get(0))?;
-        Ok(match v {
-            Some(s) if column.is_decimal() => Some(normalize_decimal(&s)?),
-            other => other,
-        })
+    /// (spec json, deleted) of a column, deleted or not.
+    fn column_row(&self, sheet_id: &str, col_id: &str) -> Result<Option<(String, bool)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT spec, deleted FROM columns WHERE sheet_id = ? AND col_id = ?",
+                params![sheet_id, col_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)),
+            )
+            .optional()?)
+    }
+
+    fn column_spec_any(&self, sheet_id: &str, col_id: &str) -> Result<ColumnSpec> {
+        let (json, _) = self.column_row(sheet_id, col_id)?.ok_or_else(|| Error::NotFound(format!("column {col_id}")))?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    /// A column that is not deleted.
+    pub fn column(&self, sheet_id: &str, col_id: &str) -> Result<ColumnInfo> {
+        self.columns(sheet_id)?
+            .into_iter()
+            .find(|c| c.col_id == col_id)
+            .ok_or_else(|| Error::NotFound(format!("column {col_id}")))
+    }
+
+    fn cell(&self, sheet_id: &str, row_id: &str, col_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM cells WHERE sheet_id = ? AND row_id = ? AND col_id = ?",
+                params![sheet_id, row_id, col_id],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     pub fn sheet(&self, sheet_id: &str) -> Result<SheetInfo> {
@@ -506,7 +675,7 @@ impl Project {
 
     pub fn sheets(&self, include_archived: bool) -> Result<Vec<SheetInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT sheet_id, name, archived, currencies, rates FROM sheets ORDER BY position, sheet_id",
+            "SELECT sheet_id, name, archived, rates, sources, fixed_rates FROM sheets ORDER BY position, sheet_id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -515,76 +684,120 @@ impl Project {
                 r.get::<_, bool>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (sheet_id, name, archived, currencies, rates) = row?;
+            let (sheet_id, name, archived, rates, sources, fixed) = row?;
             if archived && !include_archived {
                 continue;
             }
-            let currencies = currencies
-                .split(',')
-                .filter(|c| !c.is_empty())
-                .map(Currency::new)
-                .collect::<Result<Vec<_>>>()?;
-            out.push(SheetInfo { sheet_id, name, archived, currencies, rates: RateMode::from_db(&rates)? });
-        }
-        Ok(out)
-    }
-
-    /// Display currencies of a sheet, falling back to the project's.
-    pub fn display_currencies(&self, sheet: &SheetInfo) -> Vec<Currency> {
-        if sheet.currencies.is_empty() {
-            self.settings.display_currencies.clone()
-        } else {
-            sheet.currencies.clone()
-        }
-    }
-
-    /// Rows of a sheet in order, without deleted rows.
-    pub fn rows(&self, sheet_id: &str) -> Result<Vec<CostRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT row_id, position, item, url, CAST(qty AS VARCHAR), CAST(unit_price AS VARCHAR), currency, note
-             FROM cost_items WHERE sheet_id = ? AND NOT deleted ORDER BY position, row_id",
-        )?;
-        let rows = stmt.query_map(params![sheet_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, f64>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, Option<String>>(7)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (row_id, position, item, url, qty, unit_price, currency, note) = row?;
-            out.push(CostRow {
-                row_id,
-                position,
-                item,
-                url,
-                qty: qty.map(|s| parse_decimal(&s)).transpose()?,
-                unit_price: unit_price.map(|s| parse_decimal(&s)).transpose()?,
-                currency: currency.map(|c| Currency::new(&c)).transpose()?,
-                note,
+            out.push(SheetInfo {
+                sheet_id,
+                name,
+                archived,
+                rates: RateMode::from_db(&rates)?,
+                sources: serde_json::from_str(&sources)?,
+                fixed_rates: serde_json::from_str(&fixed)?,
             });
         }
         Ok(out)
     }
 
-    /// A position after the last row of a sheet.
-    pub fn next_position(&self, sheet_id: &str) -> Result<f64> {
-        let max: Option<f64> = self.conn.query_row(
-            "SELECT max(position) FROM cost_items WHERE sheet_id = ?",
-            params![sheet_id],
-            |r| r.get(0),
+    /// Columns of a sheet in order, without deleted ones.
+    pub fn columns(&self, sheet_id: &str) -> Result<Vec<ColumnInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT col_id, position, spec FROM columns WHERE sheet_id = ? AND NOT deleted ORDER BY position, col_id",
         )?;
+        let rows = stmt.query_map(params![sheet_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (col_id, position, spec) = row?;
+            out.push(ColumnInfo { col_id, position, spec: serde_json::from_str(&spec)? });
+        }
+        Ok(out)
+    }
+
+    /// Rows of a sheet in order, without deleted ones.
+    pub fn rows(&self, sheet_id: &str) -> Result<Vec<RowInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT row_id, position, kind FROM sheet_rows WHERE sheet_id = ? AND NOT deleted ORDER BY position, row_id",
+        )?;
+        let rows = stmt.query_map(params![sheet_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (row_id, position, kind) = row?;
+            out.push(RowInfo { row_id, position, kind: RowKind::parse(&kind) });
+        }
+        Ok(out)
+    }
+
+    /// All stored values of a sheet: (row_id, col_id) -> value.
+    pub fn cells(&self, sheet_id: &str) -> Result<HashMap<(String, String), String>> {
+        let mut stmt = self.conn.prepare("SELECT row_id, col_id, value FROM cells WHERE sheet_id = ?")?;
+        let rows = stmt.query_map(params![sheet_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (r, c, v) = row?;
+            out.insert((r, c), v);
+        }
+        Ok(out)
+    }
+
+    /// A position after the last row of a sheet.
+    pub fn next_row_position(&self, sheet_id: &str) -> Result<f64> {
+        let max: Option<f64> =
+            self.conn.query_row("SELECT max(position) FROM sheet_rows WHERE sheet_id = ?", params![sheet_id], |r| r.get(0))?;
         Ok(max.map_or(1.0, |m| m.floor() + 1.0))
+    }
+
+    /// A position after the last column of a sheet.
+    pub fn next_column_position(&self, sheet_id: &str) -> Result<f64> {
+        let max: Option<f64> =
+            self.conn.query_row("SELECT max(position) FROM columns WHERE sheet_id = ?", params![sheet_id], |r| r.get(0))?;
+        Ok(max.map_or(1.0, |m| m.floor() + 1.0))
+    }
+}
+
+/// Normalise a typed or pasted value for a column, or say why it does not fit.
+pub fn normalize_cell(spec: &ColumnSpec, v: &str) -> Result<String> {
+    match &spec.kind {
+        ColumnKind::Text => Ok(v.to_string()),
+        ColumnKind::Link => Ok(normalize_url(v)),
+        ColumnKind::Number => {
+            let (n, cur) = parse_amount(v)?;
+            if let Some(c) = cur {
+                return Err(Error::InvalidValue(format!("{} holds plain numbers, not {c}", spec.name)));
+            }
+            Ok(n.to_string())
+        }
+        ColumnKind::Money { currency } => {
+            let (n, cur) = parse_amount(v)?;
+            if let Some(c) = cur {
+                if &c != currency {
+                    return Err(Error::InvalidValue(format!("{} is a {currency} column; {v:?} is in {c}", spec.name)));
+                }
+            }
+            Ok(n.to_string())
+        }
+        ColumnKind::Calc { .. } => Err(Error::InvalidValue(format!("{} is calculated from a formula", spec.name))),
+    }
+}
+
+/// `rozetka.com.ua/x` becomes `https://rozetka.com.ua/x`; anything else is kept as typed.
+pub fn normalize_url(v: &str) -> String {
+    let looks_like_host = v.split('/').next().is_some_and(|h| h.contains('.') && !h.contains(' '));
+    if !v.contains("://") && looks_like_host && !v.contains(' ') {
+        format!("https://{v}")
+    } else {
+        v.to_string()
     }
 }
 
@@ -597,63 +810,162 @@ fn non_empty(s: &str, what: &str) -> Result<String> {
     }
 }
 
-/// `rozetka.com.ua/x` becomes `https://rozetka.com.ua/x`; anything else is kept as typed.
-fn normalize_url(v: &str) -> String {
-    let looks_like_host = v.split('/').next().is_some_and(|h| h.contains('.') && !h.contains(' '));
-    if !v.contains("://") && looks_like_host && !v.contains(' ') {
-        format!("https://{v}")
+fn finite(position: f64) -> Result<()> {
+    if position.is_finite() {
+        Ok(())
     } else {
-        v.to_string()
+        Err(Error::InvalidValue("position must be a number".into()))
     }
 }
 
-fn parse_decimal(s: &str) -> Result<Decimal> {
-    Decimal::from_str(s.trim()).map(|d| d.normalize()).map_err(|_| Error::InvalidAmount(s.to_string()))
-}
-
-fn normalize_decimal(s: &str) -> Result<String> {
-    Ok(parse_decimal(s)?.to_string())
-}
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::ops::ColumnKind as K;
     use rust_decimal_macros::dec;
 
-    fn new_project(dir: &Path) -> Project {
-        let s = ProjectSettings::new("Test", Currency::new("GBP").unwrap());
-        Project::create(dir, s, "mac").unwrap()
+    pub fn cur(s: &str) -> Currency {
+        Currency::new(s).unwrap()
     }
 
-    fn add_row(p: &mut Project, sheet: &str, row: &str) {
-        let pos = p.next_position(sheet).unwrap();
-        p.apply(Op::InsertRow { sheet_id: sheet.into(), row_id: row.into(), position: pos }).unwrap();
+    pub fn spec(name: &str, kind: K, total: bool) -> ColumnSpec {
+        ColumnSpec { name: name.into(), kind, total }
     }
 
-    fn set(p: &mut Project, row: &str, column: Column, v: &str) {
-        p.apply(Op::SetCell { sheet_id: "s1".into(), row_id: row.into(), column, value: Some(v.into()) })
-            .unwrap();
+    /// A project with one sheet "s" laid out like a spending list.
+    pub fn spending_project(dir: &Path) -> Project {
+        let mut p = Project::create(dir, ProjectSettings::new("Test", cur("GBP")), "mac").unwrap();
+        let cols = [
+            ("item", spec("Item", K::Text, false)),
+            ("uah", spec("UAH", K::Money { currency: cur("UAH") }, false)),
+            ("usd", spec("USD", K::Money { currency: cur("USD") }, false)),
+            ("unit", spec("Unit USD", K::Calc { formula: "coalesce(to(UAH, USD), USD)".into() }, false)),
+            ("qty", spec("Qty", K::Number, false)),
+            ("total", spec("Total USD", K::Calc { formula: "[Unit USD] * Qty".into() }, true)),
+        ];
+        let mut ops = vec![Op::CreateSheet { sheet_id: "s".into(), name: "Drone".into() }];
+        for (i, (id, s)) in cols.into_iter().enumerate() {
+            ops.push(Op::AddColumn { sheet_id: "s".into(), col_id: id.into(), position: i as f64, spec: s });
+        }
+        p.apply(Op::Batch { ops }).unwrap();
+        p
+    }
+
+    pub fn add_row(p: &mut Project, row: &str, values: &[(&str, &str)]) {
+        let pos = p.next_row_position("s").unwrap();
+        let mut ops = vec![Op::InsertRow { sheet_id: "s".into(), row_id: row.into(), position: pos }];
+        for (col, v) in values {
+            ops.push(Op::SetCell { sheet_id: "s".into(), row_id: row.into(), col_id: col.to_string(), value: Some(v.to_string()) });
+        }
+        p.apply(Op::Batch { ops }).unwrap();
     }
 
     #[test]
-    fn edits_normalise_and_persist_across_reopen() {
+    fn values_are_normalised_per_column_and_persist() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let mut p = new_project(tmp.path());
-            p.apply(Op::CreateSheet { sheet_id: "s1".into(), name: "Desk setup".into() }).unwrap();
-            add_row(&mut p, "s1", "r1");
-            set(&mut p, "r1", Column::Item, "Monitor");
-            set(&mut p, "r1", Column::UnitPrice, "₴12 499,50");
-            set(&mut p, "r1", Column::Qty, "2");
+            let mut p = spending_project(tmp.path());
+            add_row(&mut p, "r1", &[("item", "Carbon plates"), ("uah", "₴3 250,00"), ("qty", "2")]);
         }
         let p = Project::open(tmp.path(), "mac").unwrap();
         assert!(p.replay_warnings().is_empty(), "{:?}", p.replay_warnings());
-        let rows = p.rows("s1").unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].item.as_deref(), Some("Monitor"));
-        assert_eq!(rows[0].unit_price, Some(dec!(12499.5)));
-        assert_eq!(rows[0].currency.as_ref().map(|c| c.code()), Some("UAH"), "currency taken from ₴");
-        assert_eq!(rows[0].qty, Some(dec!(2)));
+        let cells = p.cells("s").unwrap();
+        assert_eq!(cells[&("r1".into(), "uah".into())], "3250");
+        assert_eq!(cells[&("r1".into(), "qty".into())], "2");
+        assert_eq!(p.columns("s").unwrap().len(), 6);
+    }
+
+    #[test]
+    fn values_that_do_not_fit_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = spending_project(tmp.path());
+        add_row(&mut p, "r1", &[]);
+        let set = |col: &str, v: &str| Op::SetCell {
+            sheet_id: "s".into(),
+            row_id: "r1".into(),
+            col_id: col.into(),
+            value: Some(v.into()),
+        };
+        assert!(p.apply(set("uah", "$25")).is_err(), "USD in the UAH column");
+        assert!(p.apply(set("qty", "lots")).is_err());
+        assert!(p.apply(set("unit", "5")).is_err(), "calculated column");
+        assert!(p.apply(set("usd", "$25")).is_ok());
+    }
+
+    #[test]
+    fn columns_insert_rename_delete_and_undo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = spending_project(tmp.path());
+        // Insert a Link column between Item (0) and UAH (1).
+        p.apply(Op::AddColumn { sheet_id: "s".into(), col_id: "link".into(), position: 0.5, spec: spec("Link", K::Link, false) })
+            .unwrap();
+        let names: Vec<_> = p.columns("s").unwrap().into_iter().map(|c| c.spec.name).collect();
+        assert_eq!(names, ["Item", "Link", "UAH", "USD", "Unit USD", "Qty", "Total USD"]);
+
+        // Duplicate names are refused.
+        assert!(p
+            .apply(Op::AddColumn { sheet_id: "s".into(), col_id: "x".into(), position: 9.0, spec: spec("qty", K::Number, false) })
+            .is_err());
+
+        // Renaming Unit USD updates the Total USD formula, and undo restores both.
+        p.apply(Op::UpdateColumn {
+            sheet_id: "s".into(),
+            col_id: "unit".into(),
+            spec: spec("Each USD", K::Calc { formula: "coalesce(to(UAH, USD), USD)".into() }, false),
+        })
+        .unwrap();
+        let total = p.column("s", "total").unwrap();
+        assert_eq!(total.spec.kind, K::Calc { formula: "[Each USD] * Qty".into() });
+        p.undo().unwrap();
+        assert_eq!(p.column("s", "total").unwrap().spec.kind, K::Calc { formula: "[Unit USD] * Qty".into() });
+
+        // Delete and restore a column.
+        p.apply(Op::SetColumnDeleted { sheet_id: "s".into(), col_id: "link".into(), deleted: true }).unwrap();
+        assert_eq!(p.columns("s").unwrap().len(), 6);
+        p.undo().unwrap();
+        assert_eq!(p.columns("s").unwrap().len(), 7);
+    }
+
+    #[test]
+    fn bad_formulas_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = spending_project(tmp.path());
+        let add = |f: &str| Op::AddColumn {
+            sheet_id: "s".into(),
+            col_id: "x".into(),
+            position: 99.0,
+            spec: spec("X", K::Calc { formula: f.into() }, false),
+        };
+        assert!(p.apply(add("Qty *")).is_err());
+        assert!(p.apply(add("X + 1")).is_err(), "refers to itself");
+        assert!(p.apply(add("= Qty * 2")).is_ok());
+        assert_eq!(p.column("s", "x").unwrap().spec.kind, K::Calc { formula: "Qty * 2".into() });
+    }
+
+    #[test]
+    fn merges_logs_from_two_machines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mac = spending_project(tmp.path());
+        add_row(&mut mac, "r1", &[("item", "Motor")]);
+        let mut hub = Project::open(tmp.path(), "hub").unwrap();
+        hub.apply(Op::InsertRow { sheet_id: "s".into(), row_id: "r2".into(), position: 2.0 }).unwrap();
+        assert!(mac.refresh().unwrap());
+        assert_eq!(mac.rows("s").unwrap().len(), 2);
+        assert!(!mac.refresh().unwrap());
+        assert!(mac.replay_warnings().is_empty());
+    }
+
+    #[test]
+    fn old_projects_are_refused_clearly() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("project.json"),
+            r#"{"name":"Old","reporting_currency":"GBP","display_currencies":["GBP"],"rate_sources":["ecb"]}"#,
+        )
+        .unwrap();
+        let err = Project::open(tmp.path(), "mac").err().unwrap().to_string();
+        assert!(err.contains("earlier version"), "{err}");
     }
 
     #[test]
@@ -661,75 +973,6 @@ mod tests {
         assert_eq!(normalize_url("rozetka.com.ua/item/1"), "https://rozetka.com.ua/item/1");
         assert_eq!(normalize_url("http://x.com"), "http://x.com");
         assert_eq!(normalize_url("ask Olena"), "ask Olena");
-    }
-
-    #[test]
-    fn undo_and_redo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut p = new_project(tmp.path());
-        p.apply(Op::CreateSheet { sheet_id: "s1".into(), name: "List".into() }).unwrap();
-        add_row(&mut p, "s1", "r1");
-        set(&mut p, "r1", Column::UnitPrice, "£10");
-        set(&mut p, "r1", Column::UnitPrice, "12");
-
-        assert!(p.undo().unwrap());
-        assert_eq!(p.rows("s1").unwrap()[0].unit_price, Some(dec!(10)));
-        assert!(p.undo().unwrap()); // price and currency together
-        let r = &p.rows("s1").unwrap()[0];
-        assert_eq!((r.unit_price, r.currency.clone()), (None, None));
-        assert!(p.redo().unwrap());
-        assert_eq!(p.rows("s1").unwrap()[0].currency.as_ref().unwrap().code(), "GBP");
-
-        assert!(p.undo().unwrap());
-        assert!(p.undo().unwrap()); // row insert
-        assert!(p.rows("s1").unwrap().is_empty());
-    }
-
-    #[test]
-    fn failed_ops_change_nothing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut p = new_project(tmp.path());
-        p.apply(Op::CreateSheet { sheet_id: "s1".into(), name: "List".into() }).unwrap();
-        add_row(&mut p, "s1", "r1");
-        let bad = Op::Batch {
-            ops: vec![
-                Op::SetCell { sheet_id: "s1".into(), row_id: "r1".into(), column: Column::Item, value: Some("Chair".into()) },
-                Op::SetCell { sheet_id: "s1".into(), row_id: "r1".into(), column: Column::Qty, value: Some("lots".into()) },
-            ],
-        };
-        assert!(p.apply(bad).is_err());
-        assert_eq!(p.rows("s1").unwrap()[0].item, None);
-        let reopened = Project::open(tmp.path(), "mac").unwrap();
-        assert_eq!(reopened.rows("s1").unwrap()[0].item, None);
-    }
-
-    #[test]
-    fn merges_logs_from_two_machines() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut mac = new_project(tmp.path());
-        mac.apply(Op::CreateSheet { sheet_id: "s1".into(), name: "List".into() }).unwrap();
-        add_row(&mut mac, "s1", "r1");
-
-        let mut hub = Project::open(tmp.path(), "hub").unwrap();
-        hub.apply(Op::InsertRow { sheet_id: "s1".into(), row_id: "r2".into(), position: 2.0 }).unwrap();
-
-        assert!(mac.refresh().unwrap());
-        assert_eq!(mac.rows("s1").unwrap().len(), 2);
-        assert!(!mac.refresh().unwrap());
-        assert!(mac.replay_warnings().is_empty());
-    }
-
-    #[test]
-    fn sql_access() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut p = new_project(tmp.path());
-        p.apply(Op::CreateSheet { sheet_id: "s1".into(), name: "List".into() }).unwrap();
-        add_row(&mut p, "s1", "r1");
-        set(&mut p, "r1", Column::UnitPrice, "19.99 EUR");
-        let total: String = p
-            .connection()
-            .query_row("SELECT CAST(sum(unit_price) AS VARCHAR) FROM cost_items", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(normalize_decimal(&total).unwrap(), "19.99");
+        let _ = dec!(1);
     }
 }

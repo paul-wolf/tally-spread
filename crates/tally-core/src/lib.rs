@@ -5,17 +5,19 @@
 //! it can be queried with SQL. The UI and the AI both work by producing [`ops::Op`]s;
 //! the engine applies them and does all the math.
 
-pub mod costlist;
 pub mod error;
 pub mod export;
+pub mod formula;
 pub mod fx;
 pub mod home;
 pub mod library;
 pub mod money;
 pub mod ops;
 pub mod project;
+pub mod sheet;
+pub mod templates;
 
 pub use error::{Error, Result};
 pub use money::{Currency, Rounding, RoundingScope};
-pub use ops::{Column, Op, RateMode};
+pub use ops::{ColumnKind, ColumnSpec, Op, RateMode, RowKind};
 pub use project::{Project, ProjectSettings};

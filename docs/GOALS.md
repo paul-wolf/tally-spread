@@ -28,6 +28,8 @@ Check every proposal and design against these goals and flag any conflict.
 - **Guiding principle:** lean on implied semantics. Most spreadsheet work is repetitive, so Tally should infer what it can (currency from the column, names from the type, rate-card base from the formulas) and ask only when it can't.
 - **Rates:** the user chooses the provider per sheet; ECB preferred. ECB does not publish UAH, so NBU fills that gap automatically. Fixed hand-set rates per sheet (e.g. 1 USD = 44.92 UAH) win over every source.
 - **Typical spending layout:** Item | Link | Note | UAH | USD | Unit USD (calc) | Qty | Total USD (calc, totalled). Spending lists of this kind are in USD and unrelated to tax; the GBP/HMRC setup applies to tax work only.
+- **Lesson (2026-10-23):** typed columns work and save a lot of time; keep the structure.
+- **Next ideas:** sheet types. Today's sheet is the table type (a dataframe or SQL table) and the basis for the others. Candidates are a summary or cross-tab sheet built from table sheets, and a ledger whose formulas can read the previous row (a running balance).
 
 ## Primary use case and first milestone: cost lists
 

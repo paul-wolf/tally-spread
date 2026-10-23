@@ -83,6 +83,13 @@ pub trait Context {
     fn depth(&self) -> usize {
         0
     }
+    /// The variable name of a column, for messages.
+    fn var_of(&self, _id: &str) -> Option<String> {
+        None
+    }
+    /// Something suspicious that is not an error (e.g. coalesce with two values
+    /// filled in), with the columns involved.
+    fn note(&self, _cols: Vec<String>, _msg: String) {}
 }
 
 // ------------------------------------------------------------------ user functions
@@ -247,6 +254,12 @@ impl Context for Call<'_> {
     }
     fn depth(&self) -> usize {
         self.parent.depth() + 1
+    }
+    fn var_of(&self, id: &str) -> Option<String> {
+        self.parent.var_of(id)
+    }
+    fn note(&self, cols: Vec<String>, msg: String) {
+        self.parent.note(cols, msg)
     }
 }
 
@@ -716,18 +729,37 @@ fn call(name: &str, args: &[Expr], ctx: &dyn Context) -> Value {
     match name {
         "coalesce" => {
             // The first value that is filled in; a problem (say, a missing rate) is
-            // reported only if nothing later fills the gap.
+            // reported only if nothing later fills the gap. More than one value filled
+            // in usually means a mistake (a price typed in two currencies), so it is noted.
             let mut first_error = None;
-            for a in args {
+            let mut chosen = None;
+            let mut filled = Vec::new();
+            for (i, a) in args.iter().enumerate() {
                 match eval(a, ctx) {
-                    Value::Empty => continue,
+                    Value::Empty => {}
                     Value::Error(e) => {
                         first_error.get_or_insert(e);
                     }
-                    v => return v,
+                    v => {
+                        filled.push(i);
+                        chosen.get_or_insert(v);
+                    }
                 }
             }
-            first_error.map_or(Value::Empty, Value::Error)
+            if filled.len() > 1 {
+                let label = |i: usize| {
+                    let names: Vec<String> = refs(&args[i]).iter().map(|id| ctx.var_of(id).unwrap_or_else(|| id.clone())).collect();
+                    if names.is_empty() { format!("value {}", i + 1) } else { names.join("/") }
+                };
+                let names: Vec<String> = filled.iter().map(|&i| label(i)).collect();
+                let listed = match names.len() {
+                    2 => format!("{} and {} are both filled in", names[0], names[1]),
+                    _ => format!("{} are all filled in", names.join(", ")),
+                };
+                let cols = filled.iter().flat_map(|&i| refs(&args[i])).collect();
+                ctx.note(cols, format!("{listed}; using {}", names[0]));
+            }
+            chosen.or(first_error.map(Value::Error)).unwrap_or(Value::Empty)
         }
         "to" => {
             let target = match eval(&args[1], ctx) {

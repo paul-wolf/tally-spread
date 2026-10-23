@@ -304,6 +304,7 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
         return isInput(c) ? { kind: GridCellKind.Text, data: "", displayData: "", allowOverlay: true } : empty;
       }
       const cell = r.cells[col];
+      const warnBg = dark ? "#4a3a12" : "#fff1c7";
       const bold = { baseFontStyle: "600 13px" };
 
       if (r.kind === "section") {
@@ -334,7 +335,10 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
           displayData: display,
           allowOverlay: true,
           contentAlign: isNumeric(c) ? "right" : "left",
-          themeOverride: c.type === "link" ? { textDark: dark ? "#7fb2ff" : "#2f5fc4" } : undefined,
+          themeOverride: {
+            ...(c.type === "link" ? { textDark: dark ? "#7fb2ff" : "#2f5fc4" } : {}),
+            ...(cell.warning ? { bgCell: warnBg } : {}),
+          },
         };
       }
 
@@ -346,7 +350,9 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
         allowOverlay: false,
         readonly: true,
         contentAlign: "right",
-        themeOverride: cell.error ? { textDark: "#d9534f" } : { textDark: dark ? "#c8c8c8" : "#333" },
+        themeOverride: cell.error
+          ? { textDark: "#d9534f" }
+          : { textDark: dark ? "#c8c8c8" : "#333", ...(cell.warning ? { bgCell: warnBg } : {}) },
       };
     },
     [view, dark, totalRow],

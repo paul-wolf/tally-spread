@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { api } from "./api";
-import type { ColumnSpec, ColumnView } from "./types";
+import type { ColumnSpec, ColumnView, UserFunction } from "./types";
 
 /** Where a column's values come from. */
 type Source = "typed" | "calc";
@@ -17,6 +17,44 @@ const CALC: { t: Type; label: string }[] = [
   { t: "money", label: "Money" },
   { t: "any", label: "As the formula gives" },
 ];
+
+/** Built-in functions, offered while typing a formula. */
+const BUILTINS: [string, string][] = [
+  ["coalesce", "first value that is filled in"],
+  ["to", "to(amount, USD): convert"],
+  ["round", "round(x, 2)"],
+  ["if", "if(cond, a, b)"],
+  ["min", "smallest"],
+  ["max", "largest"],
+  ["abs", "without the sign"],
+];
+const COMMON_CURRENCIES = ["USD", "UAH", "GBP", "EUR"];
+
+type Suggestion = { text: string; insert: string; hint: string; kind: string };
+
+/** What could complete the name being typed just before the cursor. */
+function suggestionsFor(
+  before: string,
+  cols: ColumnView[],
+  fns: UserFunction[],
+): { prefix: string; items: Suggestion[] } | null {
+  const m = /(^|[^A-Za-z0-9_\[])([A-Za-z_][A-Za-z0-9_]*)$/.exec(before);
+  if (!m) return null;
+  const prefix = m[2];
+  const p = prefix.toLowerCase();
+  const all: Suggestion[] = [
+    ...cols.map((c) => ({ text: c.var, insert: c.var, hint: `${c.col_id} · ${c.name}`, kind: "column" })),
+    ...BUILTINS.map(([f, h]) => ({ text: `${f}()`, insert: `${f}(`, hint: h, kind: "function" })),
+    ...fns.map((f) => ({ text: `${f.name}()`, insert: `${f.name}(`, hint: f.description || `${f.name}(${f.params.join(", ")})`, kind: "yours" })),
+  ];
+  const curs = [...new Set([...COMMON_CURRENCIES, ...cols.flatMap((c) => (c.type === "money" ? [c.currency] : []))])];
+  if (/^[A-Z]+$/.test(prefix)) all.push(...curs.map((c) => ({ text: c, insert: c, hint: "currency", kind: "currency" })));
+  const name = (s: Suggestion) => s.insert.replace(/\($/, "").toLowerCase();
+  const starts = all.filter((s) => name(s).startsWith(p));
+  const contains = all.filter((s) => !name(s).startsWith(p) && name(s).includes(p) && p.length >= 2);
+  const items = [...starts, ...contains].filter((s) => name(s) !== p).slice(0, 8);
+  return items.length ? { prefix, items } : null;
+}
 
 /** Examples written with this sheet's own column names where possible. */
 function examples(cols: ColumnView[]): [string, string][] {
@@ -50,6 +88,8 @@ export interface ColumnEditorProps {
   others: ColumnView[];
   /** The sheet's base currency: the default for calculated money columns. */
   baseCurrency: string;
+  /** Your own functions, offered while typing a formula. */
+  functions?: UserFunction[];
   at: { x: number; y: number };
   onSave: (spec: ColumnSpec) => void;
   onInsert?: (side: "left" | "right") => void;
@@ -66,7 +106,7 @@ function initial(column: ColumnView | null, base: string): { source: Source; typ
   return { source: "typed", type: column.type, currency: column.type === "money" ? column.currency : base };
 }
 
-export function ColumnEditor({ sheetId, column, others, baseCurrency, at, onSave, onInsert, onDelete, onClose }: ColumnEditorProps) {
+export function ColumnEditor({ sheetId, column, others, baseCurrency, functions = [], at, onSave, onInsert, onDelete, onClose }: ColumnEditorProps) {
   const init = initial(column, baseCurrency);
   const [name, setName] = useState(column?.name ?? "");
   // The variable name follows the display name until it is edited by hand.
@@ -82,6 +122,11 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, at, onSave
   const [total, setTotal] = useState(column?.total ?? false);
   const [preview, setPreview] = useState<{ ok: boolean; lines: string[] } | null>(null);
   const formulaRef = useRef<HTMLInputElement>(null);
+  // Autocomplete for the name being typed in the formula.
+  const [caret, setCaret] = useState<number | null>(null);
+  const [acIndex, setAcIndex] = useState(0);
+  const [acOff, setAcOff] = useState(false);
+  const ac = caret === null || acOff ? null : suggestionsFor(formula.slice(0, caret), others, functions);
 
   const currencyOk = /^[A-Z]{3}$/.test(currency.trim());
   // A name suggested from what the column holds, accepted with Tab or a click.
@@ -117,6 +162,22 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, at, onSave
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  const accept = (sg: Suggestion) => {
+    if (!ac || caret === null) return;
+    const start = caret - ac.prefix.length;
+    // Replace the whole word under the cursor, not just the part before it.
+    const rest = formula.slice(caret).replace(/^[A-Za-z0-9_]*/, "");
+    const next = formula.slice(0, start) + sg.insert + rest;
+    const pos = start + sg.insert.length;
+    setFormula(next);
+    setCaret(pos);
+    setAcIndex(0);
+    requestAnimationFrame(() => {
+      formulaRef.current?.focus();
+      formulaRef.current?.setSelectionRange(pos, pos);
+    });
+  };
 
   const insert = (text: string) => {
     const el = formulaRef.current;
@@ -284,14 +345,59 @@ export function ColumnEditor({ sheetId, column, others, baseCurrency, at, onSave
 
         {source === "calc" && (
           <>
-            <input
-              ref={formulaRef}
-              value={formula}
-              onChange={(e) => setFormula(e.target.value)}
-              placeholder="Formula, e.g. coalesce(price_uah, price_usd)"
-              className={preview?.ok === false ? "mono formula bad" : "mono formula"}
-              spellCheck={false}
-            />
+            <div className="ac-wrap">
+              <input
+                ref={formulaRef}
+                value={formula}
+                onChange={(e) => {
+                  setFormula(e.target.value);
+                  setCaret(e.target.selectionStart);
+                  setAcIndex(0);
+                  setAcOff(false);
+                }}
+                onSelect={(e) => setCaret((e.target as HTMLInputElement).selectionStart)}
+                onBlur={() => setTimeout(() => setCaret(null), 150)}
+                onKeyDown={(e) => {
+                  if (!ac) return;
+                  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                    e.preventDefault();
+                    const n = ac.items.length;
+                    setAcIndex((i) => (i + (e.key === "ArrowDown" ? 1 : n - 1)) % n);
+                  } else if (e.key === "Tab" || e.key === "Enter") {
+                    e.preventDefault();
+                    accept(ac.items[Math.min(acIndex, ac.items.length - 1)]);
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.nativeEvent.stopImmediatePropagation();
+                    setAcOff(true);
+                  }
+                }}
+                placeholder="Formula, e.g. coalesce(price_uah, price_usd)"
+                className={preview?.ok === false ? "mono formula bad" : "mono formula"}
+                spellCheck={false}
+                autoComplete="off"
+              />
+              {ac && (
+                <div className="ac-list">
+                  {ac.items.map((sg, i) => (
+                    <button
+                      type="button"
+                      key={sg.kind + sg.text}
+                      className={i === Math.min(acIndex, ac.items.length - 1) ? "on" : ""}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        accept(sg);
+                      }}
+                    >
+                      <span className="mono">{sg.text}</span>
+                      <span className="muted">{sg.hint}</span>
+                      <span className="muted ac-kind">{sg.kind}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             {preview && (
               <div className={preview.ok ? "ce-preview" : "ce-error"}>
                 {preview.ok ? (preview.lines.length ? preview.lines.join(" · ") : "No rows with values yet") : preview.lines[0]}

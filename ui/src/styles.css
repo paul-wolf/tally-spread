@@ -276,3 +276,13 @@ button.suggest { padding: 2px 8px; font-size: 12px; }
 .toast-btn { flex-shrink: 0; }
 .toast { max-width: 520px; }
 .column-editor > * { flex-shrink: 0; }
+
+.cell-note { display: flex; align-items: center; gap: 10px; padding: 4px 14px; font-size: 12.5px; background: #fff1c7; color: #6b4a00; border-top: 1px solid var(--line); user-select: text; }
+.cell-note.error { background: #fde8e7; color: #a12a24; }
+@media (prefers-color-scheme: dark) { .cell-note { background: #4a3a12; color: #f3d98b; } .cell-note.error { background: #4a2020; color: #f2a5a1; } }
+.ac-wrap { position: relative; }
+.ac-list { position: absolute; left: 0; right: 0; top: 100%; margin-top: 2px; z-index: 5; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 6px 18px rgba(0,0,0,.15); padding: 3px; display: flex; flex-direction: column; }
+.ac-list button { display: flex; gap: 8px; align-items: baseline; text-align: left; border: none; background: none; padding: 3px 6px; border-radius: 4px; font-size: 12.5px; }
+.ac-list button.on { background: var(--accent-soft, rgba(47,95,196,.14)); }
+.ac-list .ac-kind { margin-left: auto; font-size: 11px; }
+.warnings { max-height: 110px; overflow-y: auto; }

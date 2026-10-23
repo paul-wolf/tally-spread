@@ -77,6 +77,9 @@ pub struct CellView {
     pub value: Option<String>,
     pub currency: Option<Currency>,
     pub error: Option<String>,
+    /// Not an error, but probably a mistake (e.g. a price in two currencies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -271,6 +274,7 @@ struct RowCtx<'a> {
     columns: &'a [ColumnInfo],
     values: &'a HashMap<String, Value>,
     conv: &'a Converter<'a>,
+    notes: std::cell::RefCell<Vec<(Vec<String>, String)>>,
 }
 
 impl Context for RowCtx<'_> {
@@ -287,6 +291,14 @@ impl Context for RowCtx<'_> {
 
     fn functions(&self) -> Option<&formula::Functions> {
         Some(self.functions)
+    }
+
+    fn var_of(&self, id: &str) -> Option<String> {
+        self.columns.iter().find(|c| c.col_id == id).map(|c| c.spec.var.clone())
+    }
+
+    fn note(&self, cols: Vec<String>, msg: String) {
+        self.notes.borrow_mut().push((cols, msg));
     }
 }
 
@@ -506,6 +518,10 @@ impl Project {
 
         // Evaluate every row.
         let mut row_values: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+        // Warnings on single cells: (row index, column ID) -> message.
+        let mut cell_notes: HashMap<(usize, String), String> = HashMap::new();
+        // The same note on many rows is reported once: (column name, message) -> rows.
+        let mut grouped: Vec<((String, String), Vec<usize>)> = Vec::new();
         for (n, row) in rows.iter().enumerate() {
             let mut values: HashMap<String, Value> = HashMap::new();
             if row.kind == RowKind::Item {
@@ -514,8 +530,20 @@ impl Project {
                 }
                 for (i, expr) in &order {
                     let v = {
-                        let ctx = RowCtx { functions: self.functions(), columns: &columns, values: &values, conv: &conv };
-                        formula::eval(expr, &ctx)
+                        let ctx = RowCtx { functions: self.functions(), columns: &columns, values: &values, conv: &conv, notes: Default::default() };
+                        let v = formula::eval(expr, &ctx);
+                        for (cols, msg) in ctx.notes.into_inner() {
+                            let key = (columns[*i].spec.name.clone(), msg.clone());
+                            match grouped.iter_mut().find(|(k, _)| *k == key) {
+                                Some((_, rows)) => rows.push(n + 1),
+                                None => grouped.push((key, vec![n + 1])),
+                            }
+                            for id in cols {
+                                cell_notes.entry((n, id)).or_insert_with(|| msg.clone());
+                            }
+                            cell_notes.entry((n, columns[*i].col_id.clone())).or_insert(msg);
+                        }
+                        v
                     };
                     // A calculated column with a currency gives amounts in it: other
                         // currencies are converted at the rate card, plain numbers taken as it.
@@ -544,6 +572,15 @@ impl Project {
                 }
             }
             row_values.push(columns.iter().map(|c| values.remove(&c.col_id).unwrap_or(Value::Empty)).collect());
+        }
+
+        for ((col, msg), rows) in grouped {
+            let at = match rows.len() {
+                1 => format!("row {}", rows[0]),
+                n if n <= 6 => format!("rows {}", rows.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ")),
+                n => format!("{n} rows ({}, …)", rows[..4].iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ")),
+            };
+            warn(format!("{col}, {at}: {msg}"));
         }
 
         // Section subtotals and sheet totals.
@@ -583,6 +620,7 @@ impl Project {
                                 value: sub.as_ref().map(|t| t.amount.clone()),
                                 currency: sub.and_then(|t| t.currency),
                                 error: None,
+                                warning: None,
                             };
                         }
                         let (value, currency, error) = match &row_values[n][j] {
@@ -594,7 +632,8 @@ impl Project {
                             Value::Error(e) => (None, None, Some(e.clone())),
                             _ => (None, None, None),
                         };
-                        CellView { raw: if c.spec.kind.is_input() { raw } else { None }, value, currency, error }
+                        let warning = cell_notes.get(&(n, c.col_id.clone())).cloned();
+                        CellView { raw: if c.spec.kind.is_input() { raw } else { None }, value, currency, error, warning }
                     })
                     .collect();
                 RowView { row_id: row.row_id.clone(), position: row.position, kind: row.kind, cells }
@@ -990,6 +1029,32 @@ mod tests {
         assert_eq!(cell(&v, 0, "unit").currency.as_ref().unwrap().code(), "USD");
         assert_eq!(cell(&v, 1, "unit").value.as_deref(), Some("250.00"));
         assert_eq!(v.totals[5].as_ref().unwrap().amount, "450.00");
+    }
+
+    #[test]
+    fn coalesce_with_two_values_is_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = spending_project(tmp.path());
+        p.apply(Op::UpdateColumn {
+            sheet_id: "s".into(),
+            col_id: "unit".into(),
+            spec: crate::ops::ColumnSpec {
+                name: "Unit USD".into(),
+                var: "unit_usd".into(),
+                kind: ColumnKind::Calc { formula: "coalesce(uah, usd)".into(), currency: Some(cur("USD")) },
+                total: false,
+            },
+        })
+        .unwrap();
+        add_row(&mut p, "a", &[("uah", "4400"), ("usd", "90"), ("qty", "2")]);
+        add_row(&mut p, "b", &[("usd", "250"), ("qty", "1")]);
+        let v = p.sheet_view("s", &rates(), d("2026-10-22")).unwrap();
+        let w = cell(&v, 0, "unit").warning.clone().unwrap();
+        assert!(w.contains("both filled in") && w.contains("using"), "{w}");
+        assert!(cell(&v, 0, "uah").warning.is_some() && cell(&v, 0, "usd").warning.is_some());
+        assert_eq!(cell(&v, 0, "unit").value.as_deref(), Some("100.00"));
+        assert!(cell(&v, 1, "unit").warning.is_none());
+        assert!(v.warnings.iter().any(|x| x.starts_with("Unit USD, row 1:")), "{:?}", v.warnings);
     }
 
     #[test]

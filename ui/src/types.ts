@@ -57,6 +57,8 @@ export interface CellView {
   value: string | null;
   currency: string | null;
   error: string | null;
+  /** Not an error, but probably a mistake (e.g. a price in two currencies). */
+  warning?: string | null;
 }
 
 export interface RowView {

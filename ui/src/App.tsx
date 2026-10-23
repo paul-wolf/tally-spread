@@ -360,6 +360,7 @@ export default function App() {
         )}
       </main>
 
+      {view && <CellNote view={view} selection={selection} />}
       {view && <Totals view={view} />}
 
       <SheetTabs
@@ -383,6 +384,7 @@ export default function App() {
           column={editedColumn}
           others={view.columns.filter((c) => c !== editedColumn)}
           baseCurrency={view.rate_card.base}
+          functions={snap.functions}
           at={editing.at}
           onClose={() => setEditing(null)}
           onSave={async (spec: ColumnSpec) => {
@@ -572,6 +574,27 @@ function TopBar(props: {
   );
 }
 
+// ------------------------------------------------------------------ cell note
+
+/** The selected cell's problem, if it has one, in words you can copy. */
+function CellNote({ view, selection }: { view: SheetView; selection: GridSelection }) {
+  const at = selection.current?.cell;
+  const cell = at ? view.rows[at[1]]?.cells[at[0]] : undefined;
+  const text = cell?.error ?? cell?.warning;
+  if (!at || !text) return null;
+  const col = view.columns[at[0]];
+  return (
+    <div className={`cell-note ${cell?.error ? "error" : ""}`}>
+      <span>
+        Row {at[1] + 1}, {col?.name}: {text}
+      </span>
+      <button className="copy-link" onClick={() => void writeText(text)}>
+        Copy
+      </button>
+    </div>
+  );
+}
+
 // ------------------------------------------------------------------ totals
 
 function Totals({ view }: { view: SheetView }) {
@@ -589,7 +612,7 @@ function Totals({ view }: { view: SheetView }) {
           </div>
         ))}
         {totals.length === 0 && (
-          <div className="hint">No totals yet: click a column's header and tick “Add up”, or add a calculated column with “+ Column”.</div>
+          <div className="hint">No totals yet: click a column's header and tick “Show total”, or add a calculated column with “+ Column”.</div>
         )}
       </div>
       <div className="detail">

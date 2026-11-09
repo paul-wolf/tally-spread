@@ -146,6 +146,8 @@ pub struct Project {
     replay_warnings: Vec<String>,
     /// User functions from the library, available to formulas.
     functions: formula::Functions,
+    /// When each sheet was last changed, from the logs of every machine.
+    edited: HashMap<String, chrono::DateTime<Utc>>,
 }
 
 /// Read a project's settings without opening it.
@@ -201,6 +203,7 @@ impl Project {
             redo: vec![],
             replay_warnings: vec![],
             functions: Default::default(),
+            edited: HashMap::new(),
         };
         p.rebuild()?;
         Ok(p)
@@ -208,6 +211,11 @@ impl Project {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// When a sheet was last changed on any machine (`None` if never logged).
+    pub fn edited(&self, sheet_id: &str) -> Option<chrono::DateTime<Utc>> {
+        self.edited.get(sheet_id).copied()
     }
 
     pub fn settings(&self) -> &ProjectSettings {
@@ -285,6 +293,9 @@ impl Project {
         }
         self.last_id = id;
         let entry = LogEntry { id, ts: Utc::now(), machine: self.machine.clone(), op: op.clone() };
+        for s in op.sheet_ids() {
+            self.edited.insert(s.to_string(), entry.ts);
+        }
         let mut f = OpenOptions::new().create(true).append(true).open(self.log_path())?;
         writeln!(f, "{}", serde_json::to_string(&entry)?)?;
         f.flush()?;
@@ -303,10 +314,16 @@ impl Project {
         self.conn.set_prepared_statement_cache_capacity(64);
         let (entries, unreadable) = self.read_log()?;
         self.replay_warnings = unreadable;
+        self.edited.clear();
         for e in &entries {
             self.conn.execute_batch("BEGIN TRANSACTION")?;
             match self.exec(&e.op) {
-                Ok(_) => self.conn.execute_batch("COMMIT")?,
+                Ok(_) => {
+                    self.conn.execute_batch("COMMIT")?;
+                    for s in e.op.sheet_ids() {
+                        self.edited.insert(s.to_string(), e.ts);
+                    }
+                }
                 Err(err) => {
                     self.conn.execute_batch("ROLLBACK")?;
                     self.replay_warnings.push(format!("skipped change {} from {}: {err}", e.id, e.machine));
@@ -773,6 +790,7 @@ impl Project {
             redo: vec![],
             replay_warnings: vec![],
             functions: Default::default(),
+            edited: HashMap::new(),
         };
         let (entries, _) = probe.read_log()?;
         drop(probe);
@@ -1007,6 +1025,82 @@ impl Project {
         let max: Option<f64> =
             self.qrow("SELECT max(position) FROM columns WHERE sheet_id = ?", params![sheet_id], |r| r.get(0))?;
         Ok(max.map_or(1.0, |m| m.floor() + 1.0))
+    }
+
+    /// The operations that recreate a sheet as it is now, under `new_id`, in this or
+    /// another project: its rate settings, columns (same IDs, names, types, formulas and
+    /// order), rows (same order, sections included) and typed-in values. Deleted rows
+    /// and columns are left behind. Apply them as one [`Op::Batch`] to get one undo step.
+    pub fn copy_sheet_ops(&self, sheet_id: &str, new_id: &str) -> Result<Vec<Op>> {
+        let info = self.sheet(sheet_id)?;
+        let columns = self.columns(sheet_id)?;
+        let rows = self.rows(sheet_id)?;
+        let cells = self.cells(sheet_id)?;
+        let s = || new_id.to_string();
+
+        let mut ops = vec![Op::CreateSheet { sheet_id: s(), name: info.name.clone() }];
+        if info.rates != RateMode::Live {
+            ops.push(Op::SetSheetRates { sheet_id: s(), rates: info.rates.clone() });
+        }
+        if !info.sources.is_empty() {
+            ops.push(Op::SetSheetSources { sheet_id: s(), sources: info.sources.clone() });
+        }
+        if info.base.is_some() {
+            ops.push(Op::SetSheetBase { sheet_id: s(), base: info.base.clone() });
+        }
+        if !info.fixed_rates.is_empty() {
+            ops.push(Op::SetSheetFixedRates { sheet_id: s(), rates: info.fixed_rates.clone() });
+        }
+        // Typed columns first, then calculated ones in an order where every column a
+        // formula refers to already exists (a formula may refer to a column to its right).
+        let mut added: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pending: Vec<&ColumnInfo> = Vec::new();
+        for c in &columns {
+            if c.spec.kind.is_input() {
+                added.insert(c.col_id.clone());
+                ops.push(Op::AddColumn { sheet_id: s(), col_id: c.col_id.clone(), position: c.position, spec: c.spec.clone() });
+            } else {
+                pending.push(c);
+            }
+        }
+        let col_refs = self.col_refs(sheet_id)?;
+        let refs_of = |c: &ColumnInfo| -> Vec<String> {
+            match &c.spec.kind {
+                ColumnKind::Calc { formula: f, .. } => formula::parse(f)
+                    .and_then(|e| formula::resolve(&e, &col_refs))
+                    .map(|e| formula::refs(&e))
+                    .unwrap_or_default(),
+                _ => vec![],
+            }
+        };
+        while !pending.is_empty() {
+            let ready = pending.iter().position(|c| refs_of(c).iter().all(|r| added.contains(r) || !columns.iter().any(|x| &x.col_id == r)));
+            // No column is ready only if formulas refer to each other in a loop; add the
+            // next one anyway so the error names it.
+            let c = pending.remove(ready.unwrap_or(0));
+            added.insert(c.col_id.clone());
+            ops.push(Op::AddColumn { sheet_id: s(), col_id: c.col_id.clone(), position: c.position, spec: c.spec.clone() });
+        }
+        // Calculated columns hold no values of their own.
+        let typed: Vec<&str> = columns.iter().filter(|c| c.spec.kind.is_input()).map(|c| c.col_id.as_str()).collect();
+        let new_rows: Vec<NewRow> = rows
+            .iter()
+            .map(|r| NewRow {
+                row_id: r.row_id.clone(),
+                position: r.position,
+                cells: typed
+                    .iter()
+                    .filter_map(|c| cells.get(&(r.row_id.clone(), c.to_string())).map(|v| (c.to_string(), v.clone())))
+                    .collect(),
+            })
+            .collect();
+        if !new_rows.is_empty() {
+            ops.push(Op::InsertRows { sheet_id: s(), rows: new_rows });
+        }
+        for r in rows.iter().filter(|r| r.kind != RowKind::Item) {
+            ops.push(Op::SetRowKind { sheet_id: s(), row_id: r.row_id.clone(), kind: r.kind });
+        }
+        Ok(ops)
     }
 }
 
@@ -1392,5 +1486,55 @@ pub(crate) mod tests {
         let v = p.sheet_view("s", &crate::fx::RateTable::default(), chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()).unwrap();
         assert_eq!(v.rows[0].cells[3].value.as_deref(), Some("59.5"), "{:?}", v.warnings);
         assert_eq!(v.rows[0].cells[4].value.as_deref(), Some("2026-09-19"));
+    }
+
+    #[test]
+    fn a_sheet_copies_into_another_project_as_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut src = spending_project(&tmp.path().join("a"));
+        add_row(&mut src, "h", &[("item", "Frame")]);
+        src.apply(Op::SetRowKind { sheet_id: "s".into(), row_id: "h".into(), kind: RowKind::Section }).unwrap();
+        add_row(&mut src, "r1", &[("item", "Carbon plates"), ("uah", "3250"), ("qty", "2")]);
+        add_row(&mut src, "r2", &[("item", "Gone"), ("usd", "5")]);
+        src.apply(Op::SetRowDeleted { sheet_id: "s".into(), row_id: "r2".into(), deleted: true }).unwrap();
+        src.apply(Op::SetSheetBase { sheet_id: "s".into(), base: Some(cur("USD")) }).unwrap();
+        let fixed = vec![FixedRate { base: cur("USD"), quote: cur("UAH"), rate: "44.92".into() }];
+        src.apply(Op::SetSheetFixedRates { sheet_id: "s".into(), rates: fixed.clone() }).unwrap();
+        // A formula that refers to a column on its right.
+        src.apply(Op::AddColumn {
+            sheet_id: "s".into(),
+            col_id: "double".into(),
+            position: -1.0,
+            spec: spec("Double", K::Calc { formula: "[Total USD] * 2".into(), currency: None }, false),
+        })
+        .unwrap();
+
+        let mut dst = Project::create(tmp.path().join("b"), ProjectSettings::new("Other", cur("USD")), "mac").unwrap();
+        let ops = src.copy_sheet_ops("s", "t").unwrap();
+        dst.apply(Op::Batch { ops }).unwrap();
+
+        let t = dst.sheet("t").unwrap();
+        assert_eq!(t.name, "Drone");
+        assert_eq!(t.base, Some(cur("USD")));
+        assert_eq!(t.fixed_rates, fixed);
+        assert_eq!(dst.columns("t").unwrap(), src.columns("s").unwrap());
+        let rows: Vec<(String, RowKind)> = dst.rows("t").unwrap().into_iter().map(|r| (r.row_id, r.kind)).collect();
+        assert_eq!(rows, vec![("h".to_string(), RowKind::Section), ("r1".to_string(), RowKind::Item)]);
+        let cells = dst.cells("t").unwrap();
+        assert_eq!(cells[&("r1".into(), "uah".into())], "3250");
+        assert_eq!(cells[&("h".into(), "item".into())], "Frame");
+        assert_eq!(cells.len(), 4, "{cells:?}");
+
+        // One undo step removes the whole copy.
+        assert!(dst.undo().unwrap());
+        assert!(dst.sheets(false).unwrap().is_empty());
+        dst.redo().unwrap();
+        assert_eq!(dst.rows("t").unwrap().len(), 2);
+
+        // The copy survives reopening.
+        drop(dst);
+        let dst = Project::open(tmp.path().join("b"), "mac").unwrap();
+        assert!(dst.replay_warnings().is_empty(), "{:?}", dst.replay_warnings());
+        assert_eq!(dst.rows("t").unwrap().len(), 2);
     }
 }

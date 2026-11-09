@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Distribution, Groups, Op, ProjectSettings, RateSource, RefreshReport, Series, Snapshot, UserFunction } from "./types";
+import type { Distribution, Groups, Op, ProjectSettings, RateSource, RefreshReport, Series, SheetEntry, Snapshot, UserFunction } from "./types";
 
 export type ExportFormat = "xlsx" | "pdf" | "csv" | "json";
 
@@ -12,7 +12,18 @@ export const api = {
   sync: (sheetId: string | null) => invoke<Snapshot | null>("sync", { sheetId }),
   openProject: (dirName: string) => invoke<Snapshot>("open_project", { dirName }),
   createProject: (name: string) => invoke<Snapshot>("create_project", { name }),
-  createSheet: (name: string, template: "blank" | "spending") => invoke<Snapshot>("create_sheet", { name, template }),
+  /** A new sheet in Unfiled, or in `project` when given. */
+  newSheet: (template: "blank" | "spending", project: string | null = null) => invoke<Snapshot>("new_sheet", { template, project }),
+  sheetIndex: (includeArchived: boolean) => invoke<SheetEntry[]>("sheet_index", { includeArchived }),
+  restoreSheet: (project: string, sheetId: string) => invoke<Snapshot>("restore_sheet", { project, sheetId }),
+  pinTab: (project: string, sheetId: string, pinned: boolean, current: string | null) =>
+    invoke<Snapshot>("pin_tab", { project, sheetId, pinned, current }),
+  newSheetFromText: (text: string) => invoke<Snapshot>("new_sheet_from_text", { text }),
+  openSheet: (project: string, sheetId: string) => invoke<Snapshot>("open_sheet", { project, sheetId }),
+  closeTab: (project: string, sheetId: string, current: string | null) => invoke<Snapshot>("close_tab", { project, sheetId, current }),
+  /** Move to an existing project (`to`), or to a new one named `newProject`. */
+  moveSheet: (project: string, sheetId: string, to: string | null, newProject: string | null = null) =>
+    invoke<Snapshot>("move_sheet", { project, sheetId, to, newProject }),
   previewFormula: (sheetId: string, colId: string | null, formula: string, currency: string | null) =>
     invoke<string[]>("preview_formula", { sheetId, colId, formula, currency }),
   saveSettings: (settings: ProjectSettings, sheetId: string | null) =>

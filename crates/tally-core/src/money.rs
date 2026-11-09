@@ -155,33 +155,45 @@ pub fn parse_amount(input: &str) -> Result<(Decimal, Option<Currency>)> {
     }
 
     // Currency named by a symbol or a 3-letter code, before or after the number.
+    // Work on the lowercased text so that matches and slices refer to the same string
+    // (lowercasing can change a string's byte length), and slice only with `get`, which
+    // returns `None` instead of panicking inside a multi-byte character (e.g. Cyrillic).
     let mut currency = None;
-    let lower = s.to_lowercase();
+    s = s.to_lowercase();
     for (sym, code) in SYMBOLS {
-        if lower.starts_with(sym) {
-            s = s[sym.len()..].to_string();
+        if let Some(rest) = s.strip_prefix(sym) {
+            s = rest.to_string();
             currency = Some(Currency::new(code)?);
             break;
         }
-        if lower.ends_with(sym) {
-            s = s[..s.len() - sym.len()].to_string();
+        if let Some(rest) = s.strip_suffix(sym) {
+            s = rest.to_string();
             currency = Some(Currency::new(code)?);
             break;
         }
     }
     if currency.is_none() && s.len() > 3 {
-        let (head, tail) = (&s[..3], &s[s.len() - 3..]);
-        if head.chars().all(|c| c.is_ascii_alphabetic()) {
+        fn code(part: Option<&str>) -> Option<&str> {
+            part.filter(|p| p.chars().all(|c| c.is_ascii_alphabetic()))
+        }
+        if let (Some(head), Some(rest)) = (code(s.get(..3)), s.get(3..)) {
             currency = Some(Currency::new(head)?);
-            s = s[3..].to_string();
-        } else if tail.chars().all(|c| c.is_ascii_alphabetic()) {
+            s = rest.to_string();
+        } else if let (Some(tail), Some(rest)) = (code(s.get(s.len() - 3..)), s.get(..s.len() - 3)) {
             currency = Some(Currency::new(tail)?);
-            s = s[..s.len() - 3].to_string();
+            s = rest.to_string();
         }
     }
     if let Some(rest) = s.strip_prefix('-') {
         negative = !negative;
         s = rest.to_string();
+    }
+
+    // Scientific notation as written by loggers and pandas: `1.35e-05`, `2E3`.
+    // Read exactly (no float round trip); only a dot may be the decimal separator.
+    if let Some(d) = parse_scientific(&s) {
+        let d = if negative { -d } else { d };
+        return Ok((d.normalize(), currency));
     }
 
     if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') {
@@ -225,6 +237,37 @@ pub fn parse_amount(input: &str) -> Result<(Decimal, Option<Currency>)> {
     Ok((d.normalize(), currency))
 }
 
+/// `<digits>[.<digits>](e|E)[+|-]<digits>`, parsed exactly. `None` if `s` is not that shape
+/// or the value does not fit in a `Decimal`.
+fn parse_scientific(s: &str) -> Option<Decimal> {
+    let (mantissa, exponent) = s.split_once(['e', 'E'])?;
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if int.is_empty() && frac.is_empty()
+        || !int.chars().chain(frac.chars()).all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let exp: i32 = exponent.parse().ok()?;
+    if exp < -40 {
+        return Some(Decimal::ZERO); // below what a Decimal can hold: effectively zero
+    }
+    if exp > 40 {
+        return None; // too large for a Decimal
+    }
+    let int = if int.is_empty() { "0" } else { int };
+    let frac = if frac.is_empty() { "0" } else { frac };
+    let mut d = Decimal::from_str(&format!("{int}.{frac}")).ok()?;
+    // Shifting by ten is exact within a Decimal's 28 places; beyond that it rounds.
+    for _ in 0..exp.unsigned_abs() {
+        d = if exp > 0 { d.checked_mul(Decimal::TEN)? } else { d.checked_div(Decimal::TEN)? };
+    }
+    Some(d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +292,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_scientific_notation() {
+        assert_eq!(p("1.3552957170759328e-05"), (dec!(0.000013552957170759328), None));
+        assert_eq!(p("-2.5E3"), (dec!(-2500), None));
+        assert_eq!(p("1e+2"), (dec!(100), None));
+        assert_eq!(p(".5e1"), (dec!(5), None));
+        assert_eq!(p("3e0 USD"), (dec!(3), Some("USD".into())));
+        assert!(parse_amount("1e").is_err());
+        assert!(parse_amount("e5").is_err());
+        assert!(parse_amount("1,5e3").is_err());
+    }
+
+    #[test]
     fn detects_currencies() {
         assert_eq!(p("₴1 200"), (dec!(1200), Some("UAH".into())));
         assert_eq!(p("1 200 грн"), (dec!(1200), Some("UAH".into())));
@@ -262,6 +317,17 @@ mod tests {
         assert!(parse_amount("").is_err());
         assert!(parse_amount("abc").is_err());
         assert!(parse_amount("12a4").is_err());
+    }
+
+    #[test]
+    fn rejects_non_ascii_text_without_panicking() {
+        // Bank statements are full of Cyrillic descriptions; these used to panic by
+        // slicing inside a multi-byte character.
+        for s in ["Кафе", "Оплата товарів", "Переказ на картку", "Ab€c", "1€x", "aбв", "ГРН", "İİİİ 12"] {
+            assert!(parse_amount(s).is_err(), "{s}");
+        }
+        assert_eq!(p("1 200 ГРН"), (dec!(1200), Some("UAH".into())));
+        assert_eq!(p("1 200,50 грн."), (dec!(1200.5), Some("UAH".into())));
     }
 
     #[test]

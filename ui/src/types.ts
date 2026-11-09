@@ -153,11 +153,47 @@ export interface ProjectSettings {
   notes: string;
 }
 
+/** An open tab: a sheet in any project. */
+export interface TabInfo {
+  project: string;
+  project_name: string;
+  sheet_id: string;
+  name: string;
+  unfiled: boolean;
+  pinned: boolean;
+}
+
+/** A sheet as Home and Go to Sheet list it (every project, Unfiled included). */
+export interface SheetEntry {
+  project: string;
+  project_name: string;
+  unfiled: boolean;
+  sheet_id: string;
+  name: string;
+  archived: boolean;
+  rows: number;
+  columns: number;
+  kind: "money" | "log" | "table";
+  total: string | null;
+  total_currency: string | null;
+  /** Last changed on any machine, Unix ms. */
+  edited: number | null;
+  /** Last shown on this machine, Unix ms. */
+  opened: number | null;
+  open: boolean;
+  pinned: boolean;
+}
+
 export interface Snapshot {
   home: string;
   machine: string;
+  /** Projects to file sheets in (Unfiled is not among them). */
   projects: { dir_name: string; name: string }[];
+  /** Folder name of the shown tab's project. */
   project: string;
+  /** Folder name of Unfiled. */
+  unfiled: string;
+  tabs: TabInfo[];
   settings: ProjectSettings;
   sheets: SheetInfo[];
   sheet: SheetView | null;

@@ -42,11 +42,52 @@ Purchases are made mainly in Ukraine (UAH, prices normally include Ukrainian VAT
 
 ## Core concepts
 
-- **Global library → Projects → Sheets.**
-- **Projects** scope the data: sheets, project library entries, settings (currencies, live/locked rates, rounding, tax home, rate source) and AI notes. Lookups search the current project first, then global. A project is a folder on disk.
-- **Sheets** are tabs: data sheets (typed in) and view sheets (live summaries/cross tabs over other sheets).
-- **Reference library**: entries with a source and dated values; pasted links saved automatically; autocomplete everywhere; live or locked per row. Exchange and tax rates are global.
+- **Global library → Projects → Sheets, with sheets first (decided 2026-11-06).** Starting a sheet never asks where it goes. New sheets (⌘N, ⇧⌘N from the clipboard, imports) go to **Unfiled**, a hidden project with USD records and no tax home, unless started inside a project; they are filed later with Move to project (the tab's right-click menu). There is no current project to choose: tabs show sheets from any project, and the shown tab's project is the active one for undo, redo and settings. **Home** lists every sheet in every project (Recent, Timeline, Projects, Kind; search; archived sheets to restore), and ⌘K goes to any sheet by name. Plan and status: docs/PLAN-home.md.
+- **Projects** group sheets that share settings (currencies, live/locked rates, rounding, tax home, rate source), project library entries and AI notes, and are where summaries across sheets will live. Lookups search the sheet's own project first, then global. A project is a folder on disk.
+- **Sheets** open as tabs from any project: data sheets (typed in) and view sheets (live summaries/cross tabs over other sheets). Closing a tab never archives or deletes a sheet.
+- **Reference library**: entries with a source and dated values; pasted links saved automatically; autocomplete everywhere; live or locked per row. Exchange and tax rates are global. (The sheet list is called Home, so "Library" always means this.)
 - **Taxes** are reference data: rates by country, category and date; each row knows tax-inclusive or exclusive and its rate; net, tax and gross shown in every display currency; tax computed in original currency, then converted.
+
+## Proposals (2026-11-06, not yet decided)
+
+From a review of GridCraft (github.com/storytold/gridcraft, an open-source Rust Excel clone, MIT/Apache-2.0, commit 6a8eb4f). We take ideas only; the code is Excel-compatible Rust and not reused.
+
+### A. Formula scopes: this row, previous row, whole column or section
+
+**Conflict:** this changes the sheet model decision that "formulas are same-row". Adopting it amends that decision. It keeps one formula per column and needs no formula engine.
+
+- **What:** a calculated column's formula can read three scopes:
+  - *This row* (today): `[Unit USD] * qty`.
+  - *Previous row:* `prev(x)` is the value of column `x` in the row above, e.g. `prev(balance) + amount`. This covers the ledger sheet idea above.
+  - *Whole column or section:* `sum`, `avg`, `min`, `max` and `count` over a column, for the whole sheet or only the row's section, e.g. `total_usd / sum(total_usd)` (share of total), `price_usd - avg(price_usd, section)` (difference from the section average).
+- **Engine:** these map to DuckDB window functions, so the engine still does the maths (goal 4): `sum(x) OVER ()`, `sum(x) OVER (PARTITION BY section)`, `lag(x) OVER (ORDER BY row_pos)`. A column that reads its own previous value (`balance = prev(balance) + amount`) is not a plain `lag`. Its common form becomes a cumulative sum (`sum(amount) OVER (ORDER BY row_pos ROWS UNBOUNDED PRECEDING)`); any other self-reference is evaluated row by row in order with exact decimals.
+- **Currency and decimals:** unchanged rules (goal 2). An aggregate of a Money (USD) column is USD; aggregates use exact decimals.
+- **Filters:** aggregates inside formulas cover all rows, so stored values never change when a view is filtered. Totals shown on screen may count only visible rows; that is a display choice and separate from this.
+- **Cycles:** a column cannot aggregate itself (`sum(x)` in `x`'s own formula). It is refused like any other cycle. `prev(x)` in `x`'s own formula is allowed.
+- **Recalculation:** a formula with an aggregate depends on the whole column (or section), so a change recalculates that whole column.
+- **Open questions:**
+  - What `prev()` gives on the first row of a sheet or section (empty, so `coalesce(prev(balance), 0) + amount`?).
+  - Whether `prev()` follows the stored row order or a sort column. A view sort must not change stored values; a ledger probably orders by date.
+  - The syntax for section scope (`avg(x, section)` or something else).
+  - Whether to offer `cumsum(x)` by name as well.
+
+### B. Live statistics for the selected cells
+
+- **What:** when more than one cell is selected, the status bar shows Sum, Average and Count by default. Min, Max and a count of numeric cells can be switched on; the choice is a user preference. The figures update as the selection changes, from the keyboard as well as the mouse (goal 1).
+- **Currency (goal 2):**
+  - Money in one currency is shown in that currency: `Sum $1,234.50`.
+  - Mixed currencies are never added silently. The bar shows one sum per currency (`UAH 12,400.00 · USD 310.00`), optionally followed by a converted total in the sheet's base currency, clearly labelled: `≈ USD 612.40 at rate card`.
+  - Plain numbers are summed apart from money. Text and link cells count only towards Count.
+- **Decimals:** totals use exact decimals; averages are rounded only for display.
+- **Actions:** a figure can be copied with a click or shortcut. Later: turn a selection's figure into a section subtotal or a summary sheet.
+- **Cost:** nothing is stored and no formula is created. It is a query over the selected range.
+
+### Other candidates from the same review (not yet written up)
+
+- **A total function per column for section footers:** sum, average, count, min or max. Rows hidden by a filter are left out, and subtotals are never counted twice in a grand total (Excel's SUBTOTAL rules).
+- **Apply an operation to selected literal values** (×1.2, +10%) as one undoable edit. This is also a natural target for AI requests.
+- **A per-currency rounding rule:** round each row to the minor unit before totalling, or round only the total. Exports state which one was used, so totals match the bank and the accountant (goal 9).
+- **Multi-step actions as one undo step:** every action is a named command, and several commands can run as one undo step that rolls back if any fails, so an AI request with several steps undoes in one go.
 
 Full design doc: https://claude.ai/artifact/QQdXFgm7XTf5iW4VcSS8N9
 

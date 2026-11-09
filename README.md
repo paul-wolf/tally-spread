@@ -24,6 +24,7 @@ Status: early but usable. Sheets with your own columns, calculated columns, sect
 - **Your own functions.** Define `vat(x) = x * 0.2` or `usd(x) = to(x, USD)` once (ƒ Functions) and use them in any formula in every sheet and project; they live in the shared library and sync between machines. Functions can use their parameters, numbers, currencies, built-ins and each other (loops are refused).
 - **Exact money**: decimal arithmetic, per-currency rounding; amounts typed as `₴12 499,50`, `$ 71.50`, `1,234.56` or `12.50 EUR`.
 - **Typing and pasting like a spreadsheet.** Blank rows are always there to type into. Paste from Excel or Google Sheets anywhere (a heading row is skipped; values that don't fit a column are left out and reported). Copy, cut, transposed copy and paste, fill down, undo/redo of everything.
+- **Sheets first, projects optional.** Starting a sheet never asks where it goes: ⌘N makes a blank sheet in **Unfiled**, ⇧⌘N turns cells copied from Excel into one, and imports land there too. Tabs show sheets from any project, with the project's name after the sheet's (Unfiled sheets show none); right-click a tab to **move it to a project**, or to a new one. × or ⌘W only closes a tab. The + after the tabs is always in view; the tabs between Home and + scroll sideways. Pin a tab to keep it; past 12 open tabs, the one used least recently closes. **Home** (the first tab, ⇧⌘H) lists every sheet in every project by Recent, Timeline, Projects or Kind, with search, rows and totals, and archived sheets to restore; **⌘K** goes to any sheet by name.
 - **Sheets as tabs** (blank, a spending-list template, or **from a file**: a CSV or JSON file becomes a sheet whose columns are named after its headings and typed from its values: numbers, dates, dates and times, Unix timestamps when the heading says so (`ts`, `time`, `created_at`), money in one currency, links, text); **projects** as folders.
 - **Analyse** (toolbar or ⇧⌘A, on the selected columns): a drawer beside the grid with charts of values **over time** (against the sheet's date & time column; long logs are grouped into time buckets with the average as a line and lowest–highest as a band), **distributions** (histogram with a fitted normal curve, box plot, quartiles, outliers, skewness; counts for text columns) and **groups** (by a column, or by time every minute, hour, …: rows, mean, min, median, max). Charts save as PNG, figures copy as text, a group summary can be kept as a sheet. Nothing is added to the sheet itself.
 - **Export** to XLSX (real `=SUM()` subtotals and totals, clickable links, the rates used), PDF (laid out like the sheet, with section subtotals, totals and rates), and CSV or JSON for other tools (one line per item, its section as a field).
@@ -50,6 +51,9 @@ docs                goals and design notes
   projects/<project>/
     project.json              settings: currencies, rate sources, rounding, tax home
     ops/<machine>.jsonl       append-only log of operations
+  projects/_unfiled/          sheets not filed in a project yet (a project like any other, hidden from the project list)
+  .tabs.json                  open and pinned tabs (this machine)
+  .opened.json                when each sheet was last shown (this machine)
 ```
 
 DuckDB holds the current state in memory, rebuilt from the logs when a project opens. Only the logs need syncing and backing up.
@@ -62,6 +66,7 @@ Prerequisites: Rust (stable), Node 20+, and on Linux the Tauri system libraries 
 npm install
 npm run tauri dev        # run the app
 npm run tauri build      # build a .app / .dmg (macOS) or .deb / .AppImage (Linux)
+scripts/install-mac.sh   # macOS: build and install Tally.app in /Applications (--help for options)
 cargo test -p tally-core # engine tests
 cargo install --path crates/tally-cli   # the `tally` command
 ```
@@ -81,7 +86,7 @@ Run `tally rates update` daily, e.g. with cron: `15 7 * * * $HOME/.cargo/bin/tal
 
 ## First-run defaults
 
-A new project prefers ECB rates (NBU for hryvnia), keeps GBP as its reporting currency and the UK as tax home, and starts with a spending-list sheet. Change project settings in its `project.json`.
+A new project prefers ECB rates (NBU for hryvnia), keeps GBP as its reporting currency and the UK as tax home, and starts with a spending-list sheet (a project made with Move to project → New project… starts empty). Unfiled keeps USD records and has no tax home. Change project settings in its `project.json`.
 
 Projects made by the first skeleton version can't be opened; they are skipped.
 
@@ -89,6 +94,12 @@ Projects made by the first skeleton version can't be opened; they are skipped.
 
 | Keys | Action |
 | --- | --- |
+| ⌘N | New blank sheet in Unfiled |
+| ⌘W | Close the tab (or the open panel); the sheet stays in its project. ⇧⌘W closes the window |
+| ⇧⌘N | New sheet from the clipboard (cells copied from Excel, or CSV) |
+| ⌘K | Go to any sheet by name |
+| ⇧⌘H | Home: every sheet in every project |
+| Right-click a tab | Rename, move to project, pin, archive, close |
 | Arrows, Enter, Tab, typing | Move and edit; typing in a blank row starts a new row |
 | ⌘C / ⌘X / ⌘V | Copy / cut / paste (tab-separated, works with Excel and Google Sheets) |
 | ⇧⌘C / ⇧⌘V | Copy / paste transposed |
@@ -100,7 +111,7 @@ Projects made by the first skeleton version can't be opened; they are skipped.
 | Delete | Clear cells, or delete selected rows |
 | Double-click or right-click a column header | Edit the column: name, type, formula, style, insert, delete |
 | Double-click a calculated value | Edit its column's formula |
-| Ctrl+PageUp / PageDown | Previous / next sheet |
+| Ctrl+PageUp / PageDown | Previous / next tab |
 | ⌘-click a link | Open it |
 
 ## License

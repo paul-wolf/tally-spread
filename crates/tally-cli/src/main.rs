@@ -25,7 +25,7 @@ USAGE:
   tally projects                     list projects
   tally show <project> [sheet]       print a cost list with totals
   tally sql <project> <query>        run SQL against a project; each sheet is a table named after it
-  tally import <project> <file.csv|json>
+  tally import <project> <file.xlsx|xls|csv|json>
                                      add a file as a new sheet (columns typed from the values)
   tally export <project> <file> [sheet]
                                      export a sheet: .xlsx, .pdf, .csv or .json
@@ -201,14 +201,18 @@ fn sheet_view(project: &str, sheet: Option<&str>) -> Result<tally_core::sheet::S
 }
 
 fn import(project: &str, file: &str) -> Res {
-    let path = std::path::Path::new(file);
-    let table = tally_core::import::read_file(path).map_err(e)?;
-    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Imported").to_string();
+    let tables = tally_core::import::read_tables(std::path::Path::new(file)).map_err(e)?;
     let mut p = open(project)?;
-    let id = tally_core::Op::new_id();
     let started = std::time::Instant::now();
-    p.apply(tally_core::Op::Batch { ops: tally_core::import::sheet_ops(&table, &id, &name) }).map_err(e)?;
-    println!("imported {} rows × {} columns as sheet {name:?} in {:.1?}", table.rows.len(), table.headings.len(), started.elapsed());
+    let mut ops = Vec::new();
+    for (name, table) in &tables {
+        ops.extend(tally_core::import::sheet_ops(table, &tally_core::Op::new_id(), name));
+    }
+    p.apply(tally_core::Op::Batch { ops }).map_err(e)?;
+    for (name, table) in &tables {
+        println!("imported {} rows × {} columns as sheet {name:?}", table.rows.len(), table.headings.len());
+    }
+    println!("in {:.1?}", started.elapsed());
     Ok(())
 }
 

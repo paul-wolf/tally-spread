@@ -206,6 +206,34 @@ impl Op {
     pub fn new_id() -> String {
         Ulid::generate().to_string()
     }
+
+    /// The sheets this operation changes.
+    pub fn sheet_ids(&self) -> Vec<&str> {
+        match self {
+            Op::CreateSheet { sheet_id, .. }
+            | Op::RenameSheet { sheet_id, .. }
+            | Op::SetSheetArchived { sheet_id, .. }
+            | Op::SetSheetRates { sheet_id, .. }
+            | Op::SetSheetSources { sheet_id, .. }
+            | Op::SetSheetBase { sheet_id, .. }
+            | Op::SetSheetFixedRates { sheet_id, .. }
+            | Op::AddColumn { sheet_id, .. }
+            | Op::UpdateColumn { sheet_id, .. }
+            | Op::MoveColumn { sheet_id, .. }
+            | Op::SetColumnDeleted { sheet_id, .. }
+            | Op::InsertRow { sheet_id, .. }
+            | Op::SetRowKind { sheet_id, .. }
+            | Op::SetRowDeleted { sheet_id, .. }
+            | Op::SetCell { sheet_id, .. }
+            | Op::SetCells { sheet_id, .. }
+            | Op::InsertRows { sheet_id, .. } => vec![sheet_id.as_str()],
+            Op::Batch { ops } => {
+                let mut out: Vec<&str> = ops.iter().flat_map(|o| o.sheet_ids()).collect();
+                out.dedup();
+                out
+            }
+        }
+    }
 }
 
 /// One line of a project's operation log.

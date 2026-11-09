@@ -4,6 +4,7 @@ import {
   DataEditor,
   GridCellKind,
   GridColumnIcon,
+  type DataEditorRef,
   type EditableGridCell,
   type GridCell,
   type GridColumn,
@@ -271,9 +272,11 @@ interface Props {
   /** Open the column editor for column `index`, or for a new column at the end. */
   onEditColumn: (index: number | "new", at: Rectangle) => void;
   dark: boolean;
+  /** Lets the app scroll the grid and give it focus (column jump, row drawer). */
+  gridRef?: React.Ref<DataEditorRef>;
 }
 
-export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, dark }: Props) {
+export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, dark, gridRef }: Props) {
   const [widths, setWidths] = useState<Record<string, number>>(loadWidths);
   // The latest view and selection, readable from callbacks that run after an await.
   const viewRef = useRef(view);
@@ -511,6 +514,7 @@ export function SheetGrid({ view, apply, selection, setSelection, onEditColumn, 
 
   return (
     <DataEditor
+      ref={gridRef}
       columns={columns}
       rows={view.rows.length + BLANK_ROWS + 1}
       freezeTrailingRows={1}

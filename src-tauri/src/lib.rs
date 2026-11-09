@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tally_core::analysis;
 use tally_core::fx::sources::{self, fetch};
 use tally_core::fx::{RateRecord, RateSource, RateTable};
-use tally_core::home::{machine_id, tally_home};
+use tally_core::home::{machine_id, open_project_dir, take_open_requests, tally_home, UNFILED};
 use tally_core::library::Library;
 use tally_core::project::{read_settings, SheetInfo, FORMAT};
 use tally_core::sheet::SheetView;
@@ -70,8 +70,6 @@ fn install_panic_hook(home: PathBuf) {
     }));
 }
 
-/// Folder name of the hidden project that holds sheets not filed in any project.
-const UNFILED: &str = "_unfiled";
 /// Open tabs, kept per machine in Tally's home folder.
 const TABS_FILE: &str = ".tabs.json";
 /// When each sheet was last shown on this machine ("project/sheet" → Unix ms).
@@ -139,6 +137,47 @@ impl AppState {
 pub struct ProjectSummary {
     pub dir_name: String,
     pub name: String,
+    /// The project's colour as a hue in degrees; see [`PROJECT_HUES`].
+    pub hue: Option<u16>,
+}
+
+/// Project colours: hues (OKLCH degrees) in the order they are handed out, each far
+/// from the ones before it, so the first few projects are easy to tell apart.
+const PROJECT_HUES: [u16; 8] = [25, 230, 135, 310, 70, 185, 270, 350];
+
+/// The colour for a new project: the one fewest projects have, earliest in
+/// [`PROJECT_HUES`] on a tie.
+fn pick_hue(used: &[u16]) -> u16 {
+    *PROJECT_HUES
+        .iter()
+        .min_by_key(|h| used.iter().filter(|u| u == h).count())
+        .expect("PROJECT_HUES is not empty")
+}
+
+/// Give every project made before colours existed a colour of its own, in folder
+/// order, saved in its `project.json`. Runs at start-up, before any project is open.
+fn assign_missing_colours(home: &Path) {
+    let Ok(entries) = fs::read_dir(projects_dir(home)) else { return };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('_'))
+        .map(|e| e.path())
+        .collect();
+    dirs.sort();
+    let found: Vec<(PathBuf, ProjectSettings)> = dirs.into_iter().filter_map(|d| read_settings(&d).ok().map(|s| (d, s))).collect();
+    let mut used: Vec<u16> = found.iter().filter_map(|(_, s)| s.color).collect();
+    for (dir, mut settings) in found {
+        if settings.color.is_some() {
+            continue;
+        }
+        let hue = pick_hue(&used);
+        settings.color = Some(hue);
+        used.push(hue);
+        // Only the colour changes; the format stays as it was until the project is opened.
+        if let Ok(json) = serde_json::to_string_pretty(&settings) {
+            let _ = fs::write(dir.join("project.json"), json);
+        }
+    }
 }
 
 /// A tab as the UI shows it.
@@ -202,6 +241,9 @@ pub struct Snapshot {
     pub rate_status: Vec<RateStatus>,
     pub functions: Vec<UserFunction>,
     pub notices: Vec<String>,
+    /// Show this snapshot's sheet even if Home is shown: it was asked for from
+    /// outside the app (the `tally import` command).
+    pub focus: bool,
 }
 
 #[derive(Serialize)]
@@ -232,7 +274,7 @@ fn list_projects(home: &Path) -> Vec<ProjectSummary> {
             if settings.format < FORMAT - 1 {
                 continue;
             }
-            out.push(ProjectSummary { dir_name: e.file_name().to_string_lossy().into_owned(), name: settings.name });
+            out.push(ProjectSummary { dir_name: e.file_name().to_string_lossy().into_owned(), name: settings.name, hue: settings.color });
         }
     }
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -267,7 +309,10 @@ fn create_project_in(home: &Path, name: &str, machine: &str, starter: bool) -> R
         n += 1;
     }
     let dir = projects_dir(home).join(&dir_name);
-    let mut p = Project::create(&dir, default_settings(name), machine).map_err(err)?;
+    let mut settings = default_settings(name);
+    let used: Vec<u16> = list_projects(home).iter().filter_map(|p| p.hue).collect();
+    settings.color = Some(pick_hue(&used));
+    let mut p = Project::create(&dir, settings, machine).map_err(err)?;
     if starter {
         let ops = templates::sheet_ops("spending", &Op::new_id(), "Spending");
         p.apply(Op::Batch { ops }).map_err(err)?;
@@ -277,16 +322,9 @@ fn create_project_in(home: &Path, name: &str, machine: &str, starter: bool) -> R
     Ok((p, dir_name))
 }
 
-/// Open a project by folder name, creating Unfiled the first time it is needed:
-/// USD records, no tax home (spending lists are not tax work).
+/// Open a project by folder name, creating Unfiled the first time it is needed.
 fn open_dir(home: &Path, machine: &str, dir_name: &str) -> Result<Project, String> {
-    let dir = projects_dir(home).join(dir_name);
-    if dir_name == UNFILED && !dir.join("project.json").exists() {
-        let mut s = ProjectSettings::new("Unfiled", Currency::new("USD").map_err(err)?);
-        s.tax_home = None;
-        return Project::create(&dir, s, machine).map_err(err);
-    }
-    Project::open(dir, machine).map_err(err)
+    open_project_dir(&projects_dir(home), dir_name, machine).map_err(err)
 }
 
 fn visible(p: &Project, sheet_id: &str) -> bool {
@@ -303,6 +341,7 @@ fn init() -> Result<Inner, String> {
 
 fn init_at(home: PathBuf, machine: String) -> Result<Inner, String> {
     fs::create_dir_all(projects_dir(&home)).map_err(err)?;
+    assign_missing_colours(&home);
     let library = Library::open(home.join("library"), &machine).map_err(err)?;
     let rates = library.rates().map_err(err)?;
 
@@ -356,6 +395,10 @@ fn init_at(home: PathBuf, machine: String) -> Result<Inner, String> {
         }
     }
     inner.load_tab_projects();
+    // Files imported with `tally import` while the app wasn't running.
+    if let Some(t) = inner.open_requested() {
+        inner.current = Some(t);
+    }
     if let Some(t) = inner.current.clone().or_else(|| inner.tabs.first().cloned()) {
         inner.activate(&t.project)?;
     }
@@ -414,6 +457,7 @@ impl Inner {
                 .map(|s| RateStatus { source: s, label: s.label().into(), latest: self.rates.latest_date(s) })
                 .collect(),
             notices,
+            focus: false,
         })
     }
 
@@ -435,6 +479,53 @@ impl Inner {
         } else {
             self.others.get(dir)
         }
+    }
+
+    fn project_mut(&mut self, dir: &str) -> Option<&mut Project> {
+        if dir == self.project_dir_name {
+            Some(&mut self.project)
+        } else {
+            self.others.get_mut(dir)
+        }
+    }
+
+    /// Open the sheets that `tally import` asked for, as tabs after the current one.
+    /// Returns the tab to show (the first sheet of the latest request); a notice
+    /// says what opened.
+    fn open_requested(&mut self) -> Option<Tab> {
+        let mut show = None;
+        let mut names = Vec::new();
+        for req in take_open_requests(&self.home, &self.machine) {
+            // The command wrote to the project's log behind the app's back.
+            let ready = match self.project_mut(&req.project) {
+                Some(p) => p.refresh().is_ok(),
+                None => match open_dir(&self.home, &self.machine, &req.project) {
+                    Ok(p) => {
+                        self.others.insert(req.project.clone(), p);
+                        true
+                    }
+                    Err(_) => false,
+                },
+            };
+            let Some(p) = self.project_ref(&req.project).filter(|_| ready) else { continue };
+            let ids: Vec<String> = req.sheet_ids.into_iter().filter(|id| visible(p, id)).collect();
+            names.extend(ids.iter().filter_map(|id| p.sheet(id).ok()).map(|s| s.name));
+            for id in ids.iter().rev() {
+                self.add_tab(Tab { project: req.project.clone(), sheet_id: id.clone() });
+            }
+            if let Some(first) = ids.first() {
+                show = Some(Tab { project: req.project.clone(), sheet_id: first.clone() });
+            }
+        }
+        match names.as_slice() {
+            [] => {}
+            [one] => self.pending.push(format!("Opened “{one}” from the command line.")),
+            many => self.pending.push(format!("Opened {} sheets from the command line.", many.len())),
+        }
+        if let Some(t) = &show {
+            self.mark_opened(t);
+        }
+        show
     }
 
     /// Make `dir` the active project, keeping the previous one open.
@@ -797,7 +888,8 @@ fn redo(state: State<AppState>, sheet_id: Option<String>) -> CmdResult<Snapshot>
     })
 }
 
-/// Pick up changes synced from other machines (project log and rate library).
+/// Pick up changes synced from other machines (project log and rate library), and
+/// sheets imported from the command line.
 #[tauri::command]
 fn sync(state: State<AppState>, sheet_id: Option<String>) -> CmdResult<Option<Snapshot>> {
     guard(|| {
@@ -808,6 +900,13 @@ fn sync(state: State<AppState>, sheet_id: Option<String>) -> CmdResult<Option<Sn
         inner.load_functions()?;
         let fns_changed = inner.project.functions().list().len() != before_fns;
         let changed = inner.project.refresh().map_err(err)? || inner.rates.len() != before || fns_changed;
+        // Files imported with `tally import`: open and show them.
+        if let Some(t) = inner.open_requested() {
+            inner.activate(&t.project)?;
+            let mut s = inner.respond(Some(&t.sheet_id), vec![])?;
+            s.focus = true;
+            return Ok(Some(s));
+        }
         if changed {
             Ok(Some(inner.respond(sheet_id.as_deref(), vec![])?))
         } else {
@@ -1313,6 +1412,32 @@ mod tests {
         assert!(log.contains("not a char boundary"), "{log}");
     }
 
+    #[test]
+    fn projects_get_distinct_colours_and_keep_them() {
+        let (tmp, _inner) = fresh();
+        let home = tmp.path();
+        for n in ["Flat", "Tax", "Car", "Garden"] {
+            create_project_in(home, n, "mac", false).unwrap();
+        }
+        let hues = |h: &Path| list_projects(h).into_iter().map(|p| (p.name, p.hue.unwrap())).collect::<Vec<_>>();
+        let first = hues(home);
+        let mut distinct: Vec<u16> = first.iter().map(|(_, h)| *h).collect();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 4, "{first:?}");
+        // A project from before colours gets one at start-up; the others keep theirs.
+        let dir = projects_dir(home).join("old");
+        Project::create(&dir, default_settings("Old"), "mac").unwrap();
+        assert_eq!(read_settings(&dir).unwrap().color, None);
+        let _again = init_at(home.to_path_buf(), "mac".into()).unwrap();
+        let after = hues(home);
+        assert!(first.iter().all(|x| after.contains(x)), "{after:?}");
+        let old = after.iter().find(|(n, _)| n == "Old").unwrap().1;
+        assert!(!distinct.contains(&old), "{after:?}");
+        // Unfiled has no colour.
+        assert_eq!(read_settings(&projects_dir(home).join(UNFILED)).unwrap().color, None);
+    }
+
     fn names(s: &Snapshot) -> Vec<(String, String)> {
         s.tabs.iter().map(|t| (t.name.clone(), if t.unfiled { "Unfiled".into() } else { t.project_name.clone() })).collect()
     }
@@ -1417,6 +1542,45 @@ mod tests {
         let s = again.respond(None, vec![]).unwrap();
         assert_eq!(names(&s), before);
         assert_eq!(shown(&s).as_deref(), Some("Spending 2"));
+    }
+
+    /// What `tally import` does: add a sheet to a project's log from outside the
+    /// app (another `Project` on the same folder), then leave an open request.
+    fn import_from_command_line(home: &Path, dir: &str, csv: &str, name: &str) -> String {
+        let mut p = open_dir(home, "mac", dir).unwrap();
+        let table = tally_core::import::read_csv(csv).unwrap();
+        let id = Op::new_id();
+        p.apply(Op::Batch { ops: tally_core::import::sheet_ops(&table, &id, name) }).unwrap();
+        let req = tally_core::home::OpenRequest { project: dir.into(), sheet_ids: vec![id.clone()] };
+        tally_core::home::request_open(home, "mac", &req).unwrap();
+        id
+    }
+
+    #[test]
+    fn sheets_imported_from_the_command_line_open_while_the_app_runs() {
+        let (tmp, mut inner) = fresh();
+        inner.respond(None, vec![]).unwrap(); // Unfiled is open and cached
+        import_from_command_line(tmp.path(), UNFILED, "Item,USD\nKettle,25\n", "Kitchen");
+        let t = inner.open_requested().expect("a tab to show");
+        inner.activate(&t.project).unwrap();
+        let s = inner.respond(Some(&t.sheet_id), vec![]).unwrap();
+        assert_eq!(shown(&s).as_deref(), Some("Kitchen"));
+        assert_eq!(s.sheet.as_ref().unwrap().rows.len(), 1);
+        assert!(s.notices.iter().any(|n| n.contains("Opened “Kitchen” from the command line")));
+        assert!(inner.open_requested().is_none(), "a request is taken once");
+    }
+
+    #[test]
+    fn sheets_imported_while_the_app_was_closed_open_when_it_starts() {
+        let (tmp, mut inner) = fresh();
+        inner.respond(None, vec![]).unwrap();
+        drop(inner);
+        let (_, dir) = create_project_in(tmp.path(), "Flat", "mac", false).unwrap();
+        import_from_command_line(tmp.path(), &dir, "Item,UAH\nTiles,1200\n", "Bathroom");
+        let mut again = init_at(tmp.path().to_path_buf(), "mac".into()).unwrap();
+        let s = again.respond(None, vec![]).unwrap();
+        assert_eq!(shown(&s).as_deref(), Some("Bathroom"));
+        assert!(names(&s).contains(&("Bathroom".into(), "Flat".into())));
     }
 
     #[test]

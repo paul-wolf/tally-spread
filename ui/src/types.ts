@@ -151,6 +151,8 @@ export interface ProjectSettings {
   rounding_scope: "per_line" | "on_total";
   tax_home: string | null;
   notes: string;
+  /** The project's colour as a hue in degrees (OKLCH); absent for Unfiled. */
+  color?: number | null;
 }
 
 /** An open tab: a sheet in any project. */
@@ -184,11 +186,18 @@ export interface SheetEntry {
   pinned: boolean;
 }
 
+/** A project to file sheets in, with its colour (a hue in degrees, chosen when it was made). */
+export interface ProjectSummary {
+  dir_name: string;
+  name: string;
+  hue: number | null;
+}
+
 export interface Snapshot {
   home: string;
   machine: string;
   /** Projects to file sheets in (Unfiled is not among them). */
-  projects: { dir_name: string; name: string }[];
+  projects: ProjectSummary[];
   /** Folder name of the shown tab's project. */
   project: string;
   /** Folder name of Unfiled. */
@@ -202,6 +211,8 @@ export interface Snapshot {
   rate_status: { source: RateSource; label: string; latest: string | null }[];
   functions: UserFunction[];
   notices: string[];
+  /** Show this sheet even over Home: it was imported with `tally import`. */
+  focus: boolean;
 }
 
 export interface RefreshReport {

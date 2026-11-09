@@ -1,14 +1,14 @@
 //! `tally` command line. Meant for the always-on hub (a daily `tally rates update`)
 //! and for quick checks from a terminal.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use chrono::{Local, NaiveDate};
 use duckdb::types::Value;
 use tally_core::fx::sources::{self, fetch};
 use tally_core::fx::RateSource;
-use tally_core::home::{library_dir, machine_id, projects_dir, tally_home};
+use tally_core::home::{library_dir, machine_id, open_project_dir, projects_dir, request_open, tally_home, OpenRequest, UNFILED};
 use tally_core::library::Library;
 use tally_core::money::{format_amount, parse_amount, round, Currency};
 use tally_core::Project;
@@ -23,10 +23,14 @@ USAGE:
   tally convert <amount> <from> <to> [YYYY-MM-DD]
                                      convert using the library (sources: HMRC, NBU, ECB)
   tally projects                     list projects
-  tally show <project> [sheet]       print a cost list with totals
+  tally show <project> [sheet]       print a cost list with totals (project: unfiled for Unfiled)
   tally sql <project> <query>        run SQL against a project; each sheet is a table named after it
-  tally import <project> <file.xlsx|xls|csv|json>
-                                     add a file as a new sheet (columns typed from the values)
+  tally import [options] <file>...   add files as new sheets: one per CSV/TSV/JSON file, one per
+                                     worksheet of an Excel or ODS workbook; columns typed from the
+                                     values. Sheets go to Unfiled and open as tabs in the app.
+      -p, --project <project>        put them in a project instead (folder or project name)
+      --no-tabs                      don't open them in the app
+      --show                         bring Tally to the front (macOS; starts it if needed)
   tally export <project> <file> [sheet]
                                      export a sheet: .xlsx, .pdf, .csv or .json
   tally home                         print the Tally folder and this machine's id
@@ -46,7 +50,7 @@ fn main() -> ExitCode {
         ["show", project] => show(project, None),
         ["show", project, sheet] => show(project, Some(sheet)),
         ["sql", project, query] => sql(project, query),
-        ["import", project, file] => import(project, file),
+        ["import", rest @ ..] if !rest.is_empty() => import(rest),
         ["export", project, file] => export(project, file, None),
         ["export", project, file, sheet] => export(project, file, Some(sheet)),
         ["home"] => {
@@ -162,7 +166,7 @@ fn project_dir(name: &str) -> PathBuf {
 }
 
 fn open(name: &str) -> Result<Project, String> {
-    let mut p = Project::open(project_dir(name), &machine_id()).map_err(|err| format!("{name}: {err}"))?;
+    let mut p = Project::open(find_project(name)?, &machine_id()).map_err(|err| format!("{name}: {err}"))?;
     let (fns, problems) = library()?.functions().map_err(e)?;
     for pr in problems {
         eprintln!("warning: {pr}");
@@ -180,7 +184,10 @@ fn projects() -> Res {
     for entry in entries.flatten() {
         if entry.path().join("project.json").exists() {
             let p = Project::open(entry.path(), &machine_id()).map_err(e)?;
-            println!("{:<24} {}", entry.file_name().to_string_lossy(), p.settings().name);
+            let dir = entry.file_name().to_string_lossy().into_owned();
+            // Unfiled is typed as "unfiled" (its folder is hidden as _unfiled).
+            let dir = if dir == UNFILED { "unfiled".to_string() } else { dir };
+            println!("{dir:<24} {}", p.settings().name);
         }
     }
     Ok(())
@@ -200,20 +207,136 @@ fn sheet_view(project: &str, sheet: Option<&str>) -> Result<tally_core::sheet::S
     p.sheet_view(&chosen.sheet_id, &rates, today()).map_err(e)
 }
 
-fn import(project: &str, file: &str) -> Res {
-    let tables = tally_core::import::read_tables(std::path::Path::new(file)).map_err(e)?;
-    let mut p = open(project)?;
+struct ImportArgs<'a> {
+    project: Option<&'a str>,
+    files: Vec<&'a str>,
+    tabs: bool,
+    show: bool,
+}
+
+fn import_args<'a>(args: &[&'a str]) -> Result<ImportArgs<'a>, String> {
+    let mut out = ImportArgs { project: None, files: vec![], tabs: true, show: false };
+    let mut it = args.iter();
+    while let Some(&a) = it.next() {
+        match a {
+            "-p" | "--project" => out.project = Some(it.next().ok_or("--project needs a project name")?),
+            "--no-tabs" => out.tabs = false,
+            "--show" => out.show = true,
+            _ if a.starts_with("--project=") => out.project = Some(&a["--project=".len()..]),
+            _ if a.starts_with('-') && a.len() > 1 => return Err(format!("unknown option {a}\n\n{USAGE}")),
+            _ => out.files.push(a),
+        }
+    }
+    // The older form, `tally import <project> <file>`: a first argument that is a
+    // project and not a file.
+    if out.project.is_none() && out.files.len() > 1 && !Path::new(out.files[0]).is_file() && find_project(out.files[0]).is_ok() {
+        out.project = Some(out.files.remove(0));
+    }
+    if out.files.is_empty() {
+        return Err(format!("no files to import\n\n{USAGE}"));
+    }
+    Ok(out)
+}
+
+/// A project by folder path, folder name or project name (any case). "unfiled"
+/// is Unfiled.
+fn find_project(name: &str) -> Result<PathBuf, String> {
+    if name.eq_ignore_ascii_case("unfiled") || name == UNFILED {
+        return Ok(projects_dir().join(UNFILED));
+    }
+    let dir = project_dir(name);
+    if dir.join("project.json").exists() {
+        return Ok(dir);
+    }
+    let named = std::fs::read_dir(projects_dir()).into_iter().flatten().flatten().map(|e| e.path()).find(|p| {
+        p.join("project.json").exists()
+            && Project::open(p, &machine_id()).is_ok_and(|pr| pr.settings().name.eq_ignore_ascii_case(name.trim()))
+    });
+    named.ok_or_else(|| format!("no project {name:?} (see `tally projects`)"))
+}
+
+fn import(args: &[&str]) -> Res {
+    let args = import_args(args)?;
+    let dir = match args.project {
+        Some(name) => find_project(name)?,
+        None => projects_dir().join(UNFILED),
+    };
+    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+    // Unfiled is made on first use, as in the app.
+    let mut p = if dir.parent() == Some(projects_dir().as_path()) {
+        open_project_dir(&projects_dir(), &dir_name, &machine_id()).map_err(|err| format!("{dir_name}: {err}"))?
+    } else {
+        Project::open(&dir, &machine_id()).map_err(|err| format!("{}: {err}", dir.display()))?
+    };
+    let where_to = if dir_name == UNFILED { "Unfiled".to_string() } else { p.settings().name.clone() };
+
     let started = std::time::Instant::now();
-    let mut ops = Vec::new();
-    for (name, table) in &tables {
-        ops.extend(tally_core::import::sheet_ops(table, &tally_core::Op::new_id(), name));
+    let mut opened = Vec::new();
+    let mut failed = 0;
+    // One step per file, so a file that can't be read doesn't stop the others.
+    for file in &args.files {
+        let tables = match tally_core::import::read_tables(Path::new(file)) {
+            Ok(t) => t,
+            Err(err) => {
+                failed += 1;
+                eprintln!("{file}: {err}");
+                continue;
+            }
+        };
+        let mut ops = Vec::new();
+        let mut ids = Vec::new();
+        for (name, table) in &tables {
+            let id = tally_core::Op::new_id();
+            ops.extend(tally_core::import::sheet_ops(table, &id, name));
+            ids.push(id);
+        }
+        if let Err(err) = p.apply(tally_core::Op::Batch { ops }) {
+            failed += 1;
+            eprintln!("{file}: {err}");
+            continue;
+        }
+        for (name, table) in &tables {
+            let (rows, cols) = (table.rows.len(), table.headings.len());
+            println!("{file} → {name:?} in {where_to}: {rows} row{} × {cols} column{}", plural(rows), plural(cols));
+        }
+        opened.extend(ids);
     }
-    p.apply(tally_core::Op::Batch { ops }).map_err(e)?;
-    for (name, table) in &tables {
-        println!("imported {} rows × {} columns as sheet {name:?}", table.rows.len(), table.headings.len());
+    if !opened.is_empty() {
+        println!("in {:.1?}", started.elapsed());
     }
-    println!("in {:.1?}", started.elapsed());
-    Ok(())
+
+    // Ask this machine's app to open them (now if it's running, else when it starts).
+    let in_home = dir.parent() == Some(projects_dir().as_path());
+    if args.tabs && in_home && !opened.is_empty() {
+        let req = OpenRequest { project: dir_name, sheet_ids: opened };
+        if let Err(err) = request_open(&tally_home(), &machine_id(), &req) {
+            eprintln!("warning: could not ask the app to open the sheets: {err}");
+        }
+    }
+    if args.show {
+        show_app();
+    }
+    match failed {
+        0 => Ok(()),
+        n if n == args.files.len() => Err("nothing imported".into()),
+        n => Err(format!("{n} of {} files not imported", args.files.len())),
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// Bring Tally to the front, starting it if needed.
+fn show_app() {
+    #[cfg(target_os = "macos")]
+    match std::process::Command::new("open").args(["-a", "Tally"]).status() {
+        Ok(st) if st.success() => {}
+        Ok(_) => eprintln!("warning: could not start Tally (is Tally.app installed?)"),
+        Err(err) => eprintln!("warning: could not start Tally: {err}"),
+    }
+    #[cfg(not(target_os = "macos"))]
+    eprintln!("note: --show only works on macOS; the sheets open in Tally when it next checks (within a few seconds if it's running)");
 }
 
 fn export(project: &str, file: &str, sheet: Option<&str>) -> Res {

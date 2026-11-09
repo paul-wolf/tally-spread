@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fuzzy } from "./ColumnJump";
-import { group, money } from "./format";
-import type { SheetEntry } from "./types";
+import { group, money, projectStyle } from "./format";
+import type { ProjectSummary, SheetEntry } from "./types";
 
 // Home: every sheet in every project (Unfiled included), seen by recency, on a
 // timeline, by project or by kind, with search. Projects are a way to group sheets
@@ -114,7 +114,7 @@ function matches(e: SheetEntry, q: string): number {
 export interface HomeProps {
   /** Changes whenever the data may have changed, so Home reloads its list. */
   version: unknown;
-  projects: { dir_name: string; name: string }[];
+  projects: ProjectSummary[];
   unfiled: string;
   load: (includeArchived: boolean) => Promise<SheetEntry[]>;
   onOpen: (e: SheetEntry) => void;
@@ -284,7 +284,9 @@ export function Home(props: HomeProps) {
                       })
                     }
                   >
-                    {isCollapsed ? "▸" : "▾"} {g.label}
+                    {isCollapsed ? "▸" : "▾"}{" "}
+                    {g.project && g.project !== props.unfiled && <span className="proj-dot" style={projectStyle(props.projects, g.project)} aria-hidden />}
+                    {g.label}
                     <span className="home-group-count">{g.entries.length}</span>
                   </button>
                   {g.project && !archived && (
@@ -315,7 +317,9 @@ export function Home(props: HomeProps) {
                       {e.pinned && <span className="home-badge">pinned</span>}
                       {e.open && !e.pinned && <span className="home-badge">open</span>}
                     </span>
-                    <span className={`chip ${e.unfiled ? "unfiled" : ""}`}>{e.unfiled ? "Unfiled" : e.project_name}</span>
+                    <span className={`chip ${e.unfiled ? "unfiled" : "proj"}`} style={e.unfiled ? undefined : projectStyle(props.projects, e.project)}>
+                      {e.unfiled ? "Unfiled" : e.project_name}
+                    </span>
                     <span className="home-size">
                       {group(String(e.rows))} row{e.rows === 1 ? "" : "s"}
                     </span>

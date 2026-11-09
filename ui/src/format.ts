@@ -71,3 +71,24 @@ export function showValue(v: string | null | undefined): string {
   if (/^-?\d+(\.\d+)?$/.test(v)) return group(v);
   return localMoment(v) ?? v;
 }
+
+/**
+ * Project colours. Each project stores a hue (OKLCH degrees) chosen when it was made,
+ * so projects look different from each other; lightness and chroma come from the
+ * stylesheet (--proj-l, --proj-c), which adjusts them for dark mode.
+ */
+const FALLBACK_HUES = [25, 230, 135, 310, 70, 185, 270, 350];
+
+/** A project's hue: its stored colour, or (if it has none yet) one worked out from its folder name. */
+export function projectHue(projects: { dir_name: string; hue: number | null }[], dirName: string): number {
+  const stored = projects.find((p) => p.dir_name === dirName)?.hue;
+  if (stored !== null && stored !== undefined) return stored;
+  let h = 0;
+  for (const c of dirName) h = (Math.imul(h, 31) + c.codePointAt(0)!) >>> 0;
+  return FALLBACK_HUES[h % FALLBACK_HUES.length];
+}
+
+/** Inline style that gives an element (and its children) the project's hue as --hue. */
+export function projectStyle(projects: { dir_name: string; hue: number | null }[], dirName: string): import("react").CSSProperties {
+  return { ["--hue" as string]: projectHue(projects, dirName) } as import("react").CSSProperties;
+}

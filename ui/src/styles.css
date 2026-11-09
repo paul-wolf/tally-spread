@@ -6,6 +6,9 @@
   --line: rgba(0, 0, 0, 0.1);
   --accent: #2f6fdb;
   --accent-text: #ffffff;
+  /* Project colours: oklch(var(--proj-l) var(--proj-c) var(--hue)); see projectHue(). */
+  --proj-l: 0.52;
+  --proj-c: 0.15;
   --warn: #b25c00;
   --error: #c62828;
   font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
@@ -23,6 +26,8 @@
     --line: rgba(255, 255, 255, 0.1);
     --accent: #5b9cf5;
     --accent-text: #0b1220;
+    --proj-l: 0.76;
+    --proj-c: 0.13;
     --warn: #e5a54b;
     --error: #ef6b6b;
   }
@@ -142,6 +147,11 @@ input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accen
 .tab:hover .close, .tab.active .close { visibility: visible; }
 /* The tab's project, as quiet text after the sheet name; Unfiled sheets show none. */
 .tab .tab-project { color: var(--muted); font-size: 11px; font-weight: 400; max-width: 140px; overflow: hidden; text-overflow: ellipsis; margin-left: -2px; }
+/* A tab in a project carries the project's colour: its name, a faint underline, and
+   on the shown tab a full underline over a light tint. Unfiled tabs stay neutral. */
+.tab.in-project { --proj: oklch(var(--proj-l) var(--proj-c) var(--hue)); border-bottom-color: color-mix(in oklch, var(--proj) 40%, transparent); }
+.tab.in-project .tab-project { color: var(--proj); font-weight: 500; }
+.tab.in-project.active { border-bottom-color: var(--proj); background: color-mix(in oklch, var(--proj) 9%, var(--panel)); }
 .tab .tab-project::before { content: "· "; }
 .tabs .add { border: none; border-radius: 0; background: none; font-size: 17px; color: var(--muted); padding: 0 12px; cursor: pointer; }
 .tabs .add:hover, .tabs .add.open { color: var(--text); background: var(--panel); }
@@ -456,6 +466,9 @@ button.suggest { padding: 2px 8px; font-size: 12px; }
   white-space: nowrap;
 }
 .home-row .chip.unfiled { border-style: dashed; background: none; }
+.home-row .chip.proj, .proj-dot { --proj: oklch(var(--proj-l) var(--proj-c) var(--hue)); }
+.home-row .chip.proj { color: var(--proj); border-color: color-mix(in oklch, var(--proj) 45%, transparent); background: color-mix(in oklch, var(--proj) 10%, transparent); font-weight: 500; }
+.proj-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--proj); margin: 0 6px 0 2px; vertical-align: 0; }
 .home-size, .home-when { color: var(--muted); font-size: 12px; }
 .home-total { text-align: right; font-variant-numeric: tabular-nums; }
 .home-when { text-align: right; }

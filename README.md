@@ -29,8 +29,8 @@ Status: early but usable. Sheets with your own columns, calculated columns, sect
 - **Analyse** (toolbar or ⇧⌘A, on the selected columns): a drawer beside the grid with charts of values **over time** (against the sheet's date & time column; long logs are grouped into time buckets with the average as a line and lowest–highest as a band), **distributions** (histogram with a fitted normal curve, box plot, quartiles, outliers, skewness; counts for text columns) and **groups** (by a column, or by time every minute, hour, …: rows, mean, min, median, max). Charts save as PNG, figures copy as text, a group summary can be kept as a sheet. Nothing is added to the sheet itself.
 - **Export** to XLSX (real `=SUM()` subtotals and totals, clickable links, the rates used), PDF (laid out like the sheet, with section subtotals, totals and rates), and CSV or JSON for other tools (one line per item, its section as a field).
 - **Bold columns**: tick Bold in the column dialog; it carries into XLSX and PDF.
-- **Two machines**: logs are per machine, so a synced folder (Syncthing) never has two writers per file; the app picks up the other machine's changes every few seconds.
-- **CLI** (`tally`) for the always-on hub: daily rate updates, conversions, printing a sheet, SQL over a project, export.
+- **Two machines**: logs are per machine, so a synced folder (Syncthing) never has two machines writing one file (the app and the `tally` command on the same machine share it; each entry is a single append); the app picks up the other machine's changes every few seconds.
+- **CLI** (`tally`): load files from a terminal (they open as tabs in the running app), and for the always-on hub daily rate updates, conversions, printing a sheet, SQL over a project, export.
 
 ## Layout
 
@@ -54,6 +54,7 @@ docs                goals and design notes
   projects/_unfiled/          sheets not filed in a project yet (a project like any other, hidden from the project list)
   .tabs.json                  open and pinned tabs (this machine)
   .opened.json                when each sheet was last shown (this machine)
+  .open/<machine>/            sheets `tally import` asked this machine's app to open (taken when it next checks)
 ```
 
 DuckDB holds the current state in memory, rebuilt from the logs when a project opens. Only the logs need syncing and backing up.
@@ -71,6 +72,17 @@ cargo test -p tally-core # engine tests
 cargo install --path crates/tally-cli   # the `tally` command
 ```
 
+## Loading files from a terminal
+
+```sh
+tally import Kitchen.xlsx prices.csv           # new sheets in Unfiled, opened as tabs in the app
+tally import ~/Downloads/*.csv --show          # …and bring Tally to the front (macOS; starts it if needed)
+tally import -p "Flat renovation" quote.xlsx   # into a project (its name or folder name)
+tally import --no-tabs log-2026-11.json        # just add the sheet; it's on Home
+```
+
+One sheet per CSV, TSV or JSON file (named after the file), one per worksheet of an Excel or ODS workbook (`.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.ods`; a single worksheet takes the file's name). Columns are typed from the values, as in the app's From a file…. A file that can't be read is reported and the others still load. The running app opens the new tabs within a few seconds; if it isn't running, they open when it starts.
+
 ## On the hub (always-on Linux machine)
 
 ```sh
@@ -78,7 +90,7 @@ tally rates update                      # HMRC monthly, NBU, ECB into ~/Tally/li
 tally rates status
 tally convert 12499.50 UAH GBP
 tally show my-project
-tally import my-project flight-log.csv          # a file as a new sheet
+tally import -p my-project flight-log.csv       # a file as a new sheet (--no-tabs: nothing to open here)
 tally sql my-project "SELECT section, sum(total_usd) FROM spending GROUP BY 1"   # each sheet is a table
 ```
 

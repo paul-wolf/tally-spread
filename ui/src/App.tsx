@@ -12,7 +12,7 @@ import { ColumnJump } from "./ColumnJump";
 import { RowDrawer } from "./RowDrawer";
 import { Home } from "./Home";
 import { GoToSheet } from "./GoToSheet";
-import { money, parseTsv, shortDate, toTsv, transpose } from "./format";
+import { money, parseTsv, projectStyle, shortDate, toTsv, transpose } from "./format";
 import { SheetGrid, emptySelection, opsForBlock, opsForClear, positionBetween, selectedBlock } from "./SheetGrid";
 import type { ColumnSpec, Op, RateSource, SheetView, Snapshot, TabInfo } from "./types";
 import { SOURCE_LABEL } from "./types";
@@ -161,6 +161,11 @@ export default function App() {
       try {
         const s = await api.sync(sheetRef.current);
         if (s) show(s);
+        // Sheets imported with `tally import` are shown even over Home.
+        if (s?.focus && s.sheet) {
+          setSelection(emptySelection);
+          setHome(false);
+        }
       } catch {
         /* next tick */
       }
@@ -1008,7 +1013,8 @@ function SheetTabs(props: {
         return (
           <div
             key={key(t)}
-            className={`tab ${active ? "active" : ""}`}
+            className={`tab ${active ? "active" : ""} ${t.unfiled ? "" : "in-project"}`}
+            style={t.unfiled ? undefined : projectStyle(snap.projects, t.project)}
             onClick={() => !active && props.onSelect(t)}
             onDoubleClick={() => rename(t)}
             onContextMenu={(e) => {

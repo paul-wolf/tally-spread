@@ -66,6 +66,7 @@ Calls made while building (change any of them freely):
 - [x] **+ always in reach:** only the sheet tabs between Home and + scroll (sideways, also with a mouse wheel; no scrollbar; faded edges show more tabs that way). The shown tab scrolls into view.
 - [x] **⌘W closed the window and quit Tally.** On macOS Tally now has its own menu: File ▸ Close Tab (⌘W) and Close Window (⇧⌘W). ⌘W closes an open panel or finder first, otherwise the shown tab; on Home it does nothing. Linux has no menu bar, so the UI handles Ctrl+W.
 - [x] **Project chips looked like tabs.** Replaced by the project's name in quiet text after the sheet name ("Kitchen · Flat renovation"); Unfiled sheets show nothing. Moving is on the tab's right-click menu.
+- [x] **Project colours (2026-11-09):** each project has a colour (a hue stored as `color` in its `project.json`), chosen when it is made as the one fewest projects have, so the first eight all differ. Projects made earlier get one at start-up. The colour shows in the tab's project name and underline (with a light tint on the shown tab), and on Home in the project label and beside each project's heading. Unfiled stays neutral. There is no way to change a project's colour in the app yet, only by editing `project.json`.
 
 ## Open questions
 

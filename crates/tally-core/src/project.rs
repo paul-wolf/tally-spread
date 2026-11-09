@@ -54,6 +54,10 @@ pub struct ProjectSettings {
     /// Short notes about the project, given to the AI as context.
     #[serde(default)]
     pub notes: String,
+    /// The project's colour in the app, as a hue in degrees (OKLCH). Chosen when the
+    /// project is made so projects look different from each other; `None` for Unfiled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u16>,
 }
 
 impl ProjectSettings {
@@ -67,6 +71,7 @@ impl ProjectSettings {
             rounding_scope: RoundingScope::default(),
             tax_home: None,
             notes: String::new(),
+            color: None,
         }
     }
 }
@@ -296,9 +301,12 @@ impl Project {
         for s in op.sheet_ids() {
             self.edited.insert(s.to_string(), entry.ts);
         }
+        // One write per entry: the app and the `tally` command on the same machine
+        // append to the same log, and an appended write is never interleaved.
+        let mut line = serde_json::to_string(&entry)?;
+        line.push('\n');
         let mut f = OpenOptions::new().create(true).append(true).open(self.log_path())?;
-        writeln!(f, "{}", serde_json::to_string(&entry)?)?;
-        f.flush()?;
+        f.write_all(line.as_bytes())?;
         self.entries_applied += 1;
         Ok(())
     }
